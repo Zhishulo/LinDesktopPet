@@ -2,6 +2,12 @@
 
 本文件是 readme.md，**帮助菜单会实时读取它**，你可以随时手动修改，无需改代码。
 
+## 开源协议
+
+本项目采用 **GNU Affero General Public License v3.0（AGPL-3.0）** 开源，完整协议见 [LICENSE](LICENSE)。
+
+> 致谢：心理评测的题目数据整理自开源项目 [ClouderyStudio/psychology](https://github.com/ClouderyStudio/psychology)（AGPL-3.0）及公开心理量表，仅用于本地自评参考，不构成医疗诊断建议。若您使用本项目的任何代码或题库，请同样遵循 AGPL-3.0 协议。
+
 ## 右键菜单
 - 💬 对话：说话 / 角色介绍 / 历史记录 / 人设设置 / 御主档案 / 记忆日志 / 记忆回顾
 - 🎭 互动：转身 / 摇尾巴 / 挥手 / 猜拳 / 掷骰子
