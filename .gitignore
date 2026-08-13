@@ -1,0 +1,25 @@
+# 打包产物
+*.exe
+*.spec
+build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 运行时数据（含用户隐私，不发布；首次运行会自动生成）
+api_config.json
+assessment.json
+mood.json
+economy.json
+items.json
+profile.json
+memory.json
+chat_log.json
+notes.txt
+settings.json
+bookmarks.json
+launcher.json
+schedule.json
+memory_log/
