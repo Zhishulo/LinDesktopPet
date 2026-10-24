@@ -2192,6 +2192,21 @@ class PetWindow(QWidget):
                      "（现在麟先用离线模式陪你～）", split=False)
             self._update_mode_label()
             return
+        if err == "AI_DISABLED":
+            # AI 总开关关闭：安静走本地保底，不弹吓人的错误
+            self.busy = False
+            last_user = ""
+            for m in reversed(self.history):
+                if m.get("role") == "user":
+                    last_user = m.get("content", "")
+                    break
+            reply = self.local_reply(last_user) if last_user else "（麟在纯本地模式陪你～想用 AI 就到 🔌 API 管理里打开总开关）"
+            self.history.append({"role": "assistant", "content": reply})
+            self._trim_history()
+            append_log("assistant", reply)
+            self.say(reply, split=False)
+            self._update_mode_label()
+            return
         # API 故障时用本地保底引擎回应最后一句，保证对话不断线
         last_user = ""
         for m in reversed(self.history):
@@ -2555,8 +2570,15 @@ class PetWindow(QWidget):
                 self._aff_was_visible = False
 
     def _update_mode_label(self):
-        """状态行模式标签：AI 在线 = 走 AI；离线模式 = 本地保底台词"""
-        self.mode_label.setText("AI 在线" if self._has_api_key() else "离线模式")
+        """状态行模式标签：AI 在线 = 走 AI；离线模式 = 本地保底；AI 已停用 = 总开关关闭"""
+        try:
+            ai_on = load_api_config().get("ai_enabled", True)
+        except Exception:
+            ai_on = True
+        if not ai_on:
+            self.mode_label.setText("AI 已停用")
+        else:
+            self.mode_label.setText("AI 在线" if self._has_api_key() else "离线模式")
         self.mode_label.show()
 
     # ---------- 6 专注时钟与监督 ----------

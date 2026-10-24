@@ -1261,6 +1261,12 @@ class ApiManagerDialog(QDialog):
         tip = QLabel("支持 OpenAI 兼容接口。主 API 请求失败时会自动尝试下一个启用的 API。")
         tip.setWordWrap(True)
         lay.addWidget(tip)
+        # AI 总开关：关掉 = 不发任何 API 请求、纯本地模式（Key 和配置原样保留）
+        self.ai_check = QCheckBox("启用 AI 对话（取消勾选 = 暂不使用任何 API，即使已填 Key 也走纯本地模式）")
+        cfg0 = load_api_config()
+        self.ai_check.setChecked(cfg0.get("ai_enabled", True))
+        self.ai_check.toggled.connect(self._toggle_ai)
+        lay.addWidget(self.ai_check)
         self.current_label = QLabel("")
         self.current_label.setStyleSheet("color:#9c6b45;font-size:12px;")
         lay.addWidget(self.current_label)
@@ -1292,6 +1298,19 @@ class ApiManagerDialog(QDialog):
         lay.addLayout(h)
         self.refresh()
 
+    def _toggle_ai(self, on):
+        """AI 总开关：写入 api_config.json 并即时刷新状态行。"""
+        cfg = load_api_config()
+        cfg["ai_enabled"] = bool(on)
+        save_api_config(cfg)
+        win = self.parent()
+        if hasattr(win, "_update_mode_label"):
+            win._update_mode_label()
+        if hasattr(win, "say"):
+            win.say("好～麟切换到{}模式啦{}".format(
+                "AI 对话" if on else "纯本地", "♪" if on else "（不联网也陪你）"), split=False)
+        self.refresh()
+
     def refresh(self):
         self.list.clear()
         cfg = load_api_config()
@@ -1301,7 +1320,12 @@ class ApiManagerDialog(QDialog):
             if a.get("id") == cur:
                 cur_name = a.get("name", "")
                 break
-        self.current_label.setText("当前生效：{}（聊天优先使用，失败自动切换备用）".format(cur_name or "未设置"))
+        ai_on = cfg.get("ai_enabled", True)
+        self.ai_check.blockSignals(True)
+        self.ai_check.setChecked(ai_on)
+        self.ai_check.blockSignals(False)
+        self.current_label.setText("当前生效：{}（聊天优先使用，失败自动切换备用）{}".format(
+            cur_name or "未设置", "" if ai_on else "｜⚠️ AI 总开关已关闭，当前为纯本地模式"))
         for a in cfg.get("apis", []):
             mark = "✅ 当前　" if a.get("id") == cur else "　　　　"
             state = "启用" if a.get("enabled") else "停用"

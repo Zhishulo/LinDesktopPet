@@ -16,7 +16,7 @@ DEFAULT_API_CONFIG = {
     "apis": [
         {"id": "deepseek", "name": "DeepSeek",
          "base_url": "https://api.deepseek.com/chat/completions",
-         "model": "deepseek-chat", "key": "", "enabled": True},
+         "model": "deepseek-flash", "key": "", "enabled": True},
         {"id": "openai", "name": "OpenAI",
          "base_url": "https://api.openai.com/v1/chat/completions",
          "model": "gpt-4o-mini", "key": "", "enabled": False},
@@ -294,8 +294,10 @@ DEFAULT_README = """# 麟的桌宠 · 使用说明书
 ## API 仓库
 - 支持多家 OpenAI 兼容接口（DeepSeek / OpenAI / Kimi / 通义千问 / 智谱 / 本地 Ollama / 硅基流动等）。
 - 右键 → 🔌 API 管理 可以增删改、启用/停用、切换当前 API、测试连通。
+- **AI 总开关**：API 管理顶部的「启用 AI 对话」勾选框——取消勾选后即使填了 Key 也不发任何请求，麟用纯本地模式陪你（配置原样保留，随时勾回来）。
 - 主 API 请求失败时会自动尝试下一个启用的 API；配置保存在程序旁的 api_config.json。
-- 状态行右侧会显示接入状态：AI 在线 = 正在用 AI；离线模式 = 本地台词回复。
+- 网络更稳了：请求失败会自动绕开挂掉的系统代理直连重试；报错也说人话（模型名填错会直接显示官方支持的模型名单，比如 DeepSeek 目前是 `deepseek-flash` / `deepseek-v4-pro`，旧名 `deepseek-chat` 仍可用）。
+- 状态行右侧会显示接入状态：AI 在线 = 正在用 AI；离线模式 = 本地台词回复；AI 已停用 = 总开关关闭。
 
 ## 记忆系统
 - 麟每天 **23:50 自动**把当天的对话写成记忆日志（启动时还会补写前一天的）。
@@ -356,6 +358,13 @@ DEFAULT_README = """# 麟的桌宠 · 使用说明书
 - 程序统一按显示高度 390px（100% 缩放）缩放，画布尺寸不一致不影响屏幕表现。
 
 ## 更新记录
+### 修复：打包版（exe）无法连接任何 https 接口的问题
+- **根因**：本项目构建用的 Python 是带安全补丁的定制版，`ssl` 模块创建加密连接时会强制加载自身目录下的 `codex-rejected-cas.pem`（吊销 emSign 根证书用）。源码运行时该文件就在；**打包成 exe 后它没跟进去**，于是 exe 里所有 https 请求在建连时就报「Connection aborted / FileNotFoundError」。此问题从第一个 exe 起就存在（源码模式一直正常，所以开发时没发现）。
+- **修复（双保险）**：① 构建时把 `codex-rejected-cas.pem` 直接打进 exe；② 程序启动时自检，发现缺文件就自动补写内置副本。已用「生产代码冻结探针」实测：exe 内 https 请求恢复正常（能拿到服务端 401/200 应答）。聊天对话、📡 测试连通从此在 exe 里真正可用。
+### API 管理升级：AI 总开关 + 网络自愈 + 报错说人话
+- **AI 总开关**：🔌 API 管理顶部新增「启用 AI 对话」——取消勾选后即使填了 Key 也不发任何请求，麟用纯本地模式陪你；配置原样保留，随时勾回来。状态行会显示「AI 已停用」。
+- **网络自愈**：系统代理（Clash 等）挂掉时，请求会自动绕开代理直连重试——DeepSeek/Kimi/通义/智谱这些国内接口直连本来就能通，不再被死代理拖垮。
+- **报错说人话**：测试连通的失败信息直接告诉你原因——模型名填错会显示官方支持名单（DeepSeek 现在是 `deepseek-flash` / `deepseek-v4-pro`，旧名 `deepseek-chat` 仍可用）、Key 无效、余额不足、限流、代理挂了……一目了然。默认 DeepSeek 模型已更新为 `deepseek-flash`。
 ### 新增托盘图标 + 播放器最小化后有任务栏图标（找得到麟了）
 - **托盘常驻图标上线**：屏幕右下角（时钟旁）现在有麟的小图标——**左键/双击一下就把麟叫到最前**（被别的窗口挡住时特别好用）；右键菜单可以直接「显示/隐藏麟」「🎵 音乐播放器」「⏹ 停止音乐」「退出桌宠」。
 - **播放器最小化后在任务栏有自己的图标**：点标题栏「—」最小化，任务栏会出现麟的播放器图标，点一下就回到面板（音乐一直在放）；托盘菜单的「🎵 音乐播放器」也能召回。桌宠本体保持不占任务栏的惯例（避免被误点最小化弄丢麟），定位就交给托盘图标。

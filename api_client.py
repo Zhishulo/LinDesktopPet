@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """API 仓库（原 oc.py 三、四区相关部分）：多 API 配置读写、
 OpenAI 兼容请求（主备自动切换）、连通测试、首次运行向导、信号桥。"""
+import base64
 import ipaddress
 import json
+import os
 import socket
+import sys
 import threading
 
 import requests
+from pathlib import Path
 from urllib.parse import urlparse
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QInputDialog, QLineEdit
@@ -17,6 +21,39 @@ from data import data_dir, load_json, save_json, load_api_key, save_api_key
 # 本地接口白名单：readme 明确支持「本地 Ollama」（http://localhost:11434），
 # 环回/私网地址只对该形态放行；其余主机名一律不得指向内网/环回/保留段。
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+# ---- 冻结环境 ssl 自愈 ----
+# 本项目构建用的 Python 是带安全补丁的定制版：ssl.py 创建 SSLContext 时
+# 会强制加载自身同目录的 codex-rejected-cas.pem（吊销 emSign ECC Root CA
+# - G3 用）。源码运行时该文件就在 Python 目录里；PyInstaller 打包后
+# ssl.__file__ 指向解包临时目录，pem 没跟进去 → 任何 https 请求在创建
+# SSLContext 时直接抛 FileNotFoundError(2)，表现为「Connection aborted」。
+# 导入本模块时自检一次：缺文件就把内置的原始 pem（与基础 Python 附带的
+# 逐字节一致，906 字节）补写过去。只允许写进 realpath(sys._MEIPASS)
+# 本目录、且路径不含 ..，其余情况一律放弃并保持原行为。
+_REJECTED_CAS_PEM_B64 = "LS0tLS1CRUdJTiBUUlVTVEVEIENFUlRJRklDQVRFLS0tLS0NCk1JSUNUakNDQWRPZ0F3SUJBZ0lLUFBZSHFXaHdEdHFMaERBS0JnZ3Foa2pPUFFRREF6QnJNUXN3Q1FZRFZRUUcNCkV3SkpUakVUTUJFR0ExVUVDeE1LWlcxVGFXZHVJRkJMU1RFbE1DTUdBMVVFQ2hNY1pVMTFaR2h5WVNCVVpXTm8NCmJtOXNiMmRwWlhNZ1RHbHRhWFJsWkRFZ01CNEdBMVVFQXhNWFpXMVRhV2R1SUVWRFF5QlNiMjkwSUVOQklDMGcNClJ6TXdIaGNOTVRnd01qRTRNVGd6TURBd1doY05ORE13TWpFNE1UZ3pNREF3V2pCck1Rc3dDUVlEVlFRR0V3SkoNClRqRVRNQkVHQTFVRUN4TUtaVzFUYVdkdUlGQkxTVEVsTUNNR0ExVUVDaE1jWlUxMVpHaHlZU0JVWldOb2JtOXMNCmIyZHBaWE1nVEdsdGFYUmxaREVnTUI0R0ExVUVBeE1YWlcxVGFXZHVJRVZEUXlCU2IyOTBJRU5CSUMwZ1J6TXcNCmRqQVFCZ2NxaGtqT1BRSUJCZ1VyZ1FRQUlnTmlBQVFqcFF5NExSTDFLUE94c3QzaUFoS0FuamxmU1UyZnlTVTANCldYVHN1d1ljNThCeXIraXVMK0ZCVkljVXFFcXk2SHlDNWx0cXRkeXpkYzZMQnRDR0k3OUcxWTRQUHdUMDF4eVMNCmZ2YWxZOEwxWDQ0dVQ2RVlHUUlyTWdxQ1pIMFdrOUdqUWpCQU1CMEdBMVVkRGdRV0JCUjhYUUtFRTlUTWlwdUINCnpoY2NMaWtlbkVoalFqQU9CZ05WSFE4QkFmOEVCQU1DQVFZd0R3WURWUjBUQVFIL0JBVXdBd0VCL3pBS0JnZ3ENCmhrak9QUVFEQXdOcEFEQm1BakVBdnZOaHp3SVFIV1NWQjdnWWJvaUZCUytEQ0JlUXloK0tUT2dORzNxeHJkV0INCkNVZnZPNndJQkh4Y21iSHRSd2ZTQWpFQW5icFYvS2xLNk8zdDVuWUJRbnZJK0dEWmpWR0xWVHY3akh2clpRbkQNCitKYk5SNmlDOGhaVmR5UitFaENWQkN5ak1BaWdCZ1lFVlIwbEFBPT0NCi0tLS0tRU5EIFRSVVNURUQgQ0VSVElGSUNBVEUtLS0tLQ0K"
+
+
+def _heal_frozen_ssl_pem():
+    """打包运行时补齐 ssl 补丁需要的 pem（详见上方注释）；任何失败都静默，
+    不影响正常流程——构建参数通常已把 pem 带进包，这里只是兜底。"""
+    try:
+        if not getattr(sys, "frozen", False):
+            return
+        import ssl
+        pem = Path(os.path.dirname(ssl.__file__ or ".")).resolve() \
+            / "codex-rejected-cas.pem"
+        if pem.exists():
+            return
+        base_dir = Path(getattr(sys, "_MEIPASS", "") or ".").resolve()
+        if pem.parent != base_dir or ".." in str(pem):
+            return
+        pem.write_bytes(base64.b64decode(_REJECTED_CAS_PEM_B64))
+    except Exception:
+        pass
+
+
+_heal_frozen_ssl_pem()
 
 
 def check_api_url(url):
@@ -49,6 +86,59 @@ def check_api_url(url):
         return "接口地址校验失败: {}".format(e)
 
 
+def post_with_fallback(url, payload, headers, timeout):
+    """带「代理失败自动直连重试」的 POST。
+
+    现象：系统代理（如 Clash 127.0.0.1:xxxx）进程挂掉或抖动时，requests 默认
+    走系统代理，所有请求全部失败——但 DeepSeek/Kimi/通义/智谱这些国内接口
+    直连本来就能通。所以连接层失败（连接拒绝/超时/SSL 断流）时，用
+    trust_env=False 的会话绕开系统代理再试一次；仍失败才报错。
+    返回 (resp, None) 或 (None, err)——err 是说人话的短句。
+    """
+    try:
+        return requests.post(url, json=payload, headers=headers, timeout=timeout), None
+    except Exception as first:
+        direct = requests.Session()
+        direct.trust_env = False          # 忽略系统/环境代理，强制直连
+        try:
+            return direct.post(url, json=payload, headers=headers,
+                               timeout=timeout), None
+        except Exception as second:
+            return None, _friendly_net_error(first, second)
+
+
+def _friendly_net_error(first, second):
+    """把两层网络异常压成一句能看懂的话。"""
+    txt = (repr(first) + repr(second)).lower()
+    if "proxy" in txt or "127.0.0.1" in txt or "proxyerror" in txt:
+        return ("网络不通：系统代理疑似挂了（已自动尝试直连也失败），"
+                "检查代理软件或关掉系统代理再试")
+    if "timed out" in txt or "timeout" in txt:
+        return "连接超时：网络到接口不通（已自动尝试直连）"
+    if "ssl" in txt:
+        return "SSL 连接被中断（已自动尝试直连），多为网络/代理不稳"
+    return "网络错误（已自动尝试直连）：{}".format(repr(first)[:120])
+
+
+def friendly_http_error(status, body):
+    """HTTP 非 200 时的人话摘要；模型名错误时直接带上官方支持名单。"""
+    body = (body or "")[:300]
+    low = body.lower()
+    if status in (400, 404) and "model" in low:
+        import re as _re
+        m = _re.search(r"supported API model names\s*(?:are\s*)?(.+?)"
+                       r"(?:\s*,?\s*but\b|\.|$)", body)
+        if m:
+            return "模型名不对！官方支持：{}".format(m.group(1).strip())
+    if status == 401:
+        return "API Key 无效或已过期（HTTP 401）"
+    if status == 402:
+        return "账户余额不足（HTTP 402）"
+    if status == 429:
+        return "请求太频繁被限流（HTTP 429），稍等再试"
+    return "HTTP {}：{}".format(status, body[:150])
+
+
 def load_api_config():
     """读取 API 仓库配置；首次运行自动生成，并迁移旧 api_key.txt"""
     cfg = load_json("api_config.json", None)
@@ -68,7 +158,11 @@ def save_api_config(cfg):
 
 
 def test_api(api):
-    """向指定 API 发一条最短请求验证连通性，返回 (ok, 消息)"""
+    """向指定 API 发一条最短请求验证连通性，返回 (ok, 消息)。
+
+    网络层失败会自动直连重试（绕开可能挂掉的系统代理）；
+    模型名错误时把官方支持名单直接带回给用户。
+    """
     url = (api.get("base_url") or "").strip()
     model = (api.get("model") or "").strip()
     key = (api.get("key") or "").strip()
@@ -77,18 +171,17 @@ def test_api(api):
     bad = check_api_url(url)
     if bad:
         return False, bad
-    try:
-        headers = {"Content-Type": "application/json"}
-        if key:
-            headers["Authorization"] = "Bearer " + key
-        payload = {"model": model, "messages": [{"role": "user", "content": "你好"}],
-                   "max_tokens": 10, "stream": False}
-        r = requests.post(url, json=payload, headers=headers, timeout=20)
-        if r.status_code == 200:
-            return True, "连通正常"
-        return False, "HTTP {}: {}".format(r.status_code, r.text[:100])
-    except Exception as e:
-        return False, repr(e)[:100]
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    payload = {"model": model, "messages": [{"role": "user", "content": "你好"}],
+               "max_tokens": 10, "stream": False}
+    r, err = post_with_fallback(url, payload, headers, timeout=20)
+    if err:
+        return False, err
+    if r.status_code == 200:
+        return True, "连通正常（模型 {}）".format(model)
+    return False, friendly_http_error(r.status_code, r.text)
 
 def ask_api_key_once():
     """首次运行配置向导：把用户自己的 DeepSeek Key 存入 API 仓库"""
@@ -135,6 +228,11 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
     失败自动切换下一个启用的 API；全部失败时发回错误信号。"""
     def run():
         cfg = load_api_config()
+        # AI 总开关：关掉时不发任何请求，直接走本地保底（配置里的 Key 原样保留）
+        if not cfg.get("ai_enabled", True):
+            bus.reply_error.emit("AI_DISABLED")
+            bus.reply_error_kind.emit("AI_DISABLED", kind)
+            return
         cur = cfg.get("current", "")
         apis = [a for a in cfg.get("apis", []) if a.get("enabled")]
         order = [a for a in apis if a.get("id") == cur] + [a for a in apis if a.get("id") != cur]
@@ -159,9 +257,12 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                 headers = {"Content-Type": "application/json"}
                 if key:
                     headers["Authorization"] = "Bearer " + key
-                resp = requests.post(url, json=payload, headers=headers, timeout=60)
+                resp, net_err = post_with_fallback(url, payload, headers, timeout=60)
+                if net_err:
+                    last_err = net_err
+                    continue
                 if resp.status_code != 200:
-                    last_err = "HTTP {}: {}".format(resp.status_code, resp.text[:120])
+                    last_err = friendly_http_error(resp.status_code, resp.text)
                     continue
                 data = resp.json()
                 try:
@@ -187,7 +288,7 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                     bus.summary_ready.emit(content)
                 return
             except Exception as exc:
-                last_err = repr(exc)
+                last_err = _friendly_net_error(exc, exc)
         bus.reply_error.emit(last_err)
         bus.reply_error_kind.emit(last_err, kind)
     threading.Thread(target=run, daemon=True).start()
