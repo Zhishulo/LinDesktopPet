@@ -34,6 +34,7 @@
 import json
 import os
 import time
+from pathlib import Path
 
 CARE_VERSION = 1
 
@@ -415,8 +416,8 @@ class CareTracker(object):
             payload = self.state.to_dict()
             temp_path = self.state_path + ".tmp"
             # self.state_path 已在 __init__ 做过防穿越校验（必须落在数据目录内）
-            with open(temp_path, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, indent=2)
+            Path(temp_path).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(temp_path, self.state_path)
             try:
                 stat = os.stat(self.state_path)
