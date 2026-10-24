@@ -53,7 +53,8 @@ import music_folder                          # 本地音乐播放器（QMediaPla
 from local_brain import local_reply as _local_reply
 from memory import memory_log_dir, write_daily_log, extract_facts_local
 from mood import (load_moods, save_moods, recent_records, NEGATIVE_KEYS,
-                  mood_name, mood_reply, pick_warm_word)
+                  mood_name, mood_reply, mood_emoji, pick_warm_word, add_record)
+from mood_summary import build_prompt, parse_mood_json, should_summarize
 from assessment import recent_assessment
 from widgets import BubbleLabel, PetLabel
 from crash_guard import install as install_crash_guard
@@ -349,6 +350,10 @@ class PetWindow(QWidget):
         # 即使 CONTEXT_BUDGET_ENABLED=False 也保留这个对象：它只是状态容器，不会主动做任何事。
         self.ctx = ContextBudget().load()
         self._summary_pending = False       # 摘要请求在途标记，避免重复发
+        # 聊天情绪总结（mood_summary.py）：攒的用户消息数 + 在途标记。
+        # 计数只放内存：重启丢一次进度无所谓，少总结一轮而已。
+        self._chat_pending = 0
+        self._mood_summary_pending = False
         # 听歌感知：每 15 秒采样一次「系统正在播放什么」，再决定要不要搭话
         self.listener = listening.ListenTracker()
         self._listen_warm = False           # now_playing 是否已在后台线程预热过
@@ -421,6 +426,7 @@ class PetWindow(QWidget):
         self.bus.weather_ready.connect(self._on_weather, Qt.QueuedConnection)
         self.bus.ping_ready.connect(self._on_ping, Qt.QueuedConnection)
         self.bus.summary_ready.connect(self._on_summary, Qt.QueuedConnection)   # 滚动摘要回填
+        self.bus.mood_ready.connect(self._on_mood_summary, Qt.QueuedConnection) # 聊天情绪总结回写
 
         self.send_btn.clicked.connect(self.send_message)
         self.input.returnPressed.connect(self.send_message)
@@ -1094,6 +1100,52 @@ class PetWindow(QWidget):
                 print("[上下文摘要] 空摘要，忽略")
         except Exception as e:
             print("[上下文摘要] 回填失败", e)
+
+    # ---------- 聊天情绪总结（mood_summary.py，设置里可开关） ----------
+    def _maybe_summarize_chat_mood(self):
+        """聊天回复完成后：设置开启 + 攒够消息 + 不在冷却期，就请 AI 把
+        最近聊天总结成一条情绪记录。门槛判定见 mood_summary.should_summarize；
+        任何失败都静默（少记一条情绪而已，绝不打扰聊天主流程）。"""
+        try:
+            if self._mood_summary_pending:
+                return
+            from api_client import load_api_config
+            if not load_api_config().get("ai_enabled", True):
+                return                      # AI 总开关关着：连请求都不发
+            data = load_moods()
+            ok, reason = should_summarize(self.settings, data,
+                                          self._has_api_key(), self._chat_pending)
+            if not ok:
+                return
+            self._mood_summary_pending = True
+            # 在「发起请求」时就落盘冷却时间并清零计数：失败也不重复轰炸，
+            # 下一轮重新攒消息即可（计数在内存，重启自然归零）。
+            data["chat_summary_at"] = time.strftime("%Y-%m-%d %H:%M")
+            data["chat_pending"] = 0
+            save_moods(data)
+            self._chat_pending = 0
+            ask_llm(build_prompt(self.history), self.bus,
+                    kind="mood", temperature=0.3, max_tokens=150)
+        except Exception as e:
+            self._mood_summary_pending = False
+            print("[聊天情绪总结] 跳过", e)
+
+    def _on_mood_summary(self, content):
+        """收到情绪总结：解析校验后写入 mood.json（source="chat"），
+        情绪历史/统计/主动关心自动纳入；解析失败静默放弃。"""
+        self._mood_summary_pending = False
+        try:
+            parsed = parse_mood_json(content)
+            if not parsed:
+                print("[聊天情绪总结] 回包不合规，忽略:", str(content)[:120])
+                return
+            rec = add_record(parsed["mood"], parsed["intensity"],
+                             parsed["tags"], note=parsed["note"], source="chat")
+            self.say("麟默默记下了你刚才的心情：{} {}（{}/5）".format(
+                mood_emoji(rec["mood"]), mood_name(rec["mood"]),
+                rec["intensity"]), split=False)
+        except Exception as e:
+            print("[聊天情绪总结] 写入失败", e)
 
     # ---------- 记忆系统（每天写日志，越用越懂使用者） ----------
     def _mem_dir(self):
@@ -2098,6 +2150,7 @@ class PetWindow(QWidget):
                 and any(k in text for k in ["你", "麟"]):
             self._pending_emotion = (IMG_LOVE, 1.3)
         self.add_affinity(1)
+        self._chat_pending += 1    # 聊天情绪总结：攒一句用户消息（在线/离线都算）
         # 无可用 API 时走本地保底（QQ 宠物式离线陪伴），不进入思考状态
         if not self._has_api_key():
             reply = self.local_reply(text)
@@ -2139,6 +2192,7 @@ class PetWindow(QWidget):
         done = self._emotion_after(pend[0], pend[1]) if pend else None
         self.say(content, on_done=done)
         self._maybe_request_summary()      # 聊天结束后再考虑压缩，避免并发两次请求
+        self._maybe_summarize_chat_mood()  # 设置开启时：攒够了就请 AI 总结一次情绪
 
     def _on_api_error_kind(self, err, kind):
         """带请求类型的失败回调：只处理失败的那一件事，不牵连别的状态"""
@@ -2152,6 +2206,12 @@ class PetWindow(QWidget):
             self._api_kind = None
             self._summary_pending = False
             print("[上下文摘要失败·静默]", err)
+            return
+        # 聊天情绪总结失败：同样静默丢弃（少一条记录而已），且不能动 busy
+        if getattr(self, "_api_kind", None) == "mood":
+            self._api_kind = None
+            self._mood_summary_pending = False
+            print("[聊天情绪总结失败·静默]", err)
             return
         self.busy = False
         print("[API 错误]", err)

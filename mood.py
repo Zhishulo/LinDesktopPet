@@ -100,7 +100,9 @@ WARM_WORDS = {
 
 def default_moods():
     return {"records": [], "custom_tags": [], "streak_date": "", "streak": 0,
-            "last_care_date": ""}
+            "last_care_date": "",
+            # 聊天情绪总结（mood_summary.py）的状态：上次总结时间 + 攒的待总结消息数
+            "chat_summary_at": "", "chat_pending": 0}
 
 
 def load_moods():
@@ -117,8 +119,12 @@ def save_moods(data):
     save_json(MOOD_FILE, data)
 
 
-def add_record(mood_key, intensity, tags, note="", diary=""):
-    """新增一条情绪记录，更新连续打卡天数，返回新记录"""
+def add_record(mood_key, intensity, tags, note="", diary="", source=""):
+    """新增一条情绪记录，更新连续打卡天数，返回新记录。
+
+    source：记录来源。手动记录留空；聊天总结写 "chat"（情绪历史面板
+    会显示「AI总结」标记），与手动记录同一体系、可照常删除/统计。
+    """
     data = load_moods()
     rec = {
         "mood": mood_key,
@@ -126,6 +132,7 @@ def add_record(mood_key, intensity, tags, note="", diary=""):
         "tags": [t for t in (tags or []) if t],
         "note": (note or "").strip(),
         "diary": (diary or "").strip(),
+        "source": source or "",
         "created_at": time.strftime("%Y-%m-%d %H:%M"),
     }
     data.setdefault("records", []).append(rec)

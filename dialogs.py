@@ -775,12 +775,13 @@ class MoodHistoryDialog(QDialog):
             idx = len(records) - 1 - i
             tags = "[" + "、".join(r.get("tags", [])) + "]" if r.get("tags") else ""
             note = r.get("note", "") or ""
-            line = "{}  {} {}（{}/5）{}{}".format(
+            src = " ·AI总结" if r.get("source") == "chat" else ""
+            line = "{}  {} {}（{}/5）{}{}{}".format(
                 (r.get("created_at") or "")[5:16],
                 mood_emoji(r.get("mood", "neutral")),
                 mood_name(r.get("mood", "neutral")),
                 r.get("intensity", 3), tags,
-                ("  " + note) if note else "")
+                ("  " + note) if note else "", src)
             w = QWidget()
             h = QHBoxLayout(w)
             h.setContentsMargins(8, 4, 8, 4)
@@ -1453,6 +1454,13 @@ class SettingsDialog(QDialog):
         self.top_check.setChecked(bool(getattr(parent, "_always_on_top", True)))
         lay.addWidget(self.top_check)
 
+        # 聊天情绪总结（默认关）：开启后 AI 定期从聊天里总结情绪写进情绪记录
+        self.mood_check = QCheckBox(
+            "🤖 聊天总结情绪：AI 定期从聊天中总结你的情绪，自动记入情绪记录"
+            "（攒够 4 句且间隔 1 小时才总结一次；记录仍只存本地，可照常删除）")
+        self.mood_check.setChecked(bool(parent.settings.get("chat_mood_summary", False)))
+        lay.addWidget(self.mood_check)
+
         h = QHBoxLayout()
         reset_btn = QPushButton("恢复默认")
         reset_btn.setStyleSheet("QPushButton{background:#e0c9a8;color:#3d2b1f;border:none;border-radius:8px;padding:6px 12px;}")
@@ -1481,6 +1489,7 @@ class SettingsDialog(QDialog):
         self.evt_max_spin.setValue(120)
         self.wt_slider.setValue(60)
         self.top_check.setChecked(True)
+        self.mood_check.setChecked(False)
 
     def save_settings(self):
         win = self.parent
@@ -1491,6 +1500,7 @@ class SettingsDialog(QDialog):
         win.settings["event_min"] = evt_min // 60
         win.settings["event_max"] = evt_max // 60
         win.settings["event_weight"] = self.wt_slider.value()
+        win.settings["chat_mood_summary"] = self.mood_check.isChecked()
         save_json("settings.json", win.settings)
         win.idle_timeout = self.chat_spin.value() * 60
         win.event_min = evt_min

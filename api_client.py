@@ -219,6 +219,7 @@ class SignalBus(QObject):
     food_ready  = pyqtSignal(str)       # 食物评价
     memory_ready = pyqtSignal(str)      # 每日记忆归档 JSON
     summary_ready = pyqtSignal(str)     # 滚动对话摘要（context_budget 上下文压缩）
+    mood_ready = pyqtSignal(str)        # 聊天情绪总结 JSON（mood_summary → mood.json）
     weather_ready = pyqtSignal(str)     # 天气 JSON
     ping_ready  = pyqtSignal(bool, int) # (是否在线, 延迟ms)
 
@@ -286,6 +287,9 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                 elif kind == "summary":
                     # 滚动摘要：由 PetWindow._on_summary 回填并持久化；失败走 reply_error_kind
                     bus.summary_ready.emit(content)
+                elif kind == "mood":
+                    # 聊天情绪总结：由 PetWindow._on_mood_summary 解析并写入 mood.json
+                    bus.mood_ready.emit(content)
                 return
             except Exception as exc:
                 last_err = _friendly_net_error(exc, exc)
