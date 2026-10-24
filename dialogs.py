@@ -74,6 +74,126 @@ class HistoryDialog(QDialog):
         self.refresh()
 
 
+class ChatWindow(QDialog):
+    """聊天窗口模式：气泡式的完整对话界面（用户右 / 麟左），与桌宠气泡是
+    同一场对话。开着时聊天回复显示在这里（桌宠不再打字泡），关掉自动回到
+    气泡模式——「自由切换」就是开/关这个窗口。非模态 + 原生标题栏三键，
+    最小化后任务栏可召回（与音乐播放器同款管理方式）。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_win = parent
+        self.setWindowTitle("💬 和麟聊天（窗口模式）")
+        self.setWindowFlags(Qt.Window
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
+        self.setMinimumSize(480, 520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 8)
+        tip = QLabel("同一场对话：这里发的消息 = 气泡模式的消息。关掉窗口（或点「回到气泡」）就切回桌宠气泡～")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#8a6f4d;font-size:11px;")
+        lay.addWidget(tip)
+
+        self.list = QListWidget()
+        self.list.setStyleSheet(
+            "QListWidget{background:#f7efe2;border:1px solid #e0cdb2;border-radius:10px;}"
+            "QListWidget::item{margin:2px;}")
+        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
+        lay.addWidget(self.list, 1)
+
+        row = QHBoxLayout()
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("和麟说点什么…（Enter 发送，# 开头是指令）")
+        self.input.returnPressed.connect(self._send)
+        self.input.setStyleSheet(
+            "QLineEdit{background:#fdf6ec;border:1px solid #cbb797;border-radius:16px;"
+            "padding:7px 14px;color:#3d2b1f;font-size:13px;}")
+        b_send = QPushButton("发送")
+        b_send.setDefault(True)
+        b_send.setStyleSheet(
+            "QPushButton{background:#9c6b45;color:#fff;border:none;border-radius:8px;padding:7px 16px;}")
+        b_send.clicked.connect(self._send)
+        b_back = QPushButton("💬 回到气泡")
+        b_back.setStyleSheet(
+            "QPushButton{background:#e0c9a8;color:#3d2b1f;border:none;border-radius:8px;padding:7px 12px;}")
+        b_back.clicked.connect(self.close)     # 关窗 = 切回气泡模式
+        row.addWidget(self.input, 1)
+        row.addWidget(b_send)
+        row.addWidget(b_back)
+        lay.addLayout(row)
+
+    # ---- 对外接口 ----
+    def load_history(self, history):
+        """打开时把当前对话（win.history）装进来"""
+        self.list.clear()
+        for m in (history or []):
+            role = m.get("role", "assistant")
+            if role in ("user", "assistant"):
+                self._add_row(role, m.get("content", ""), quiet=True)
+
+    def append_message(self, role, text):
+        """双方新消息都走这里（用户从桌宠输入框发的也会同步进来）"""
+        self._add_row(role, text, quiet=False)
+
+    # ---- 内部 ----
+    def _add_row(self, role, text, quiet=False):
+        text = str(text or "").strip()
+        if not text:
+            return
+        import time as _time
+        ts = _time.strftime("%H:%M")
+        bubble = QLabel(text)
+        bubble.setWordWrap(True)
+        bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        if role == "user":
+            bubble.setStyleSheet(
+                "background:#e9d9b8;border-radius:12px;padding:8px 13px;"
+                "color:#3d2b1f;font-size:13px;")
+        else:
+            bubble.setStyleSheet(
+                "background:#fdf6ec;border:1px solid #e0cdb2;border-radius:12px;"
+                "padding:8px 13px;color:#3d2b1f;font-size:13px;")
+        tlab = QLabel(("幸歌" if role == "user" else "麟") + " · " + ts)
+        tlab.setStyleSheet("color:#b9a68c;font-size:10px;")
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        v.addWidget(bubble)
+        v.addWidget(tlab, 0, Qt.AlignLeft)
+        box.setMaximumWidth(400)
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(8, 3, 8, 3)
+        if role == "user":
+            h.addStretch(1)
+            h.addWidget(box)
+        else:
+            h.addWidget(box)
+            h.addStretch(1)
+        w.adjustSize()
+        it = QListWidgetItem()
+        it.setSizeHint(w.sizeHint())
+        self.list.addItem(it)
+        self.list.setItemWidget(it, w)
+        if not quiet:
+            self.list.scrollToBottom()
+
+    def _send(self):
+        text = self.input.text().strip()
+        if not text:
+            return
+        win = self.parent_win
+        if win is None:
+            return
+        self.input.clear()
+        self.input.setFocus()
+        # 走桌宠同一条发送管线（历史/日志/情绪总结/API 全都一致）
+        win._send_text(text)
+
+
 class HelpDialog(QDialog):
     """2. 动态使用说明书：实时读取本地 readme.md"""
     def __init__(self, parent=None):

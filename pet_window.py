@@ -64,7 +64,7 @@ from dialogs import (HistoryDialog, HelpDialog, MemoryDialog, PersonaDialog,
                      NoteDialog, ShopDialog, ApiEditDialog, ApiManagerDialog,
                      SettingsDialog, MoodRecordDialog, MoodHistoryDialog,
                      MoodStatsDialog, CrisisSupportDialog, AssessmentDialog,
-                     AssessmentHistoryDialog, MusicPlayerDialog)
+                     AssessmentHistoryDialog, MusicPlayerDialog, ChatWindow)
 class _EventOverlay(QFrame):
     """随机事件选项条：pet 窗口内的普通子控件，不是独立窗口。
 
@@ -397,6 +397,7 @@ class PetWindow(QWidget):
         self._music_player = None          # 八音盒播放器（music_box.MusicPlayer，降级后备）
         self._mf_player = None             # 本地音乐播放器（music_folder.MusicFolderPlayer）
         self._music_dlg = None             # 音乐面板（非模态；None=没开，hidden=最小化中）
+        self._chat_dlg = None              # 聊天窗口（非模态；开着=窗口模式，关掉自动回气泡）
         self._music_started_at = 0.0       # 起播时刻（clock_tick 收尾判断的宽限期基准）
         self._event_defer = 0              # 随机事件弹窗因用户忙碌被推迟的次数
         self._event_created_at = 0.0       # 当前待展示事件的生成时刻（0=未知）
@@ -2128,16 +2129,22 @@ class PetWindow(QWidget):
             return
         self.input.clear()
         self.input.setFocus()
+        self._send_text(text)
+
+    def _send_text(self, text):
+        """发送管线的正文（桌宠输入框与聊天窗口共用）：指令、历史、
+        日志、情绪总结计数、本地保底/在线请求全在这里。"""
         # 隐藏指令永远可用（睡眠中也能用 #醒 叫醒）
         if text.startswith("#"):
             self._handle_command(text)
             return
         if self.busy:
-            self.say("麟还在想刚才的问题呢，等一下下嘛～", split=False)
+            self._chat_reply_out("麟还在想刚才的问题呢，等一下下嘛～")
             return
         # 睡眠不拒收：只是语气带睡意，照样 100% 完整回复
         self.history.append({"role": "user", "content": text})
         self._trim_history()
+        self._chat_window_append("user", text)   # 聊天窗口开着就同步显示
         append_log("user", text)
         # 即时记住用户透露的事实（本地规则，静默保存，越用越懂）
         self._extract_facts_local(text)
@@ -2163,7 +2170,7 @@ class PetWindow(QWidget):
             pend = getattr(self, "_pending_emotion", None)
             self._pending_emotion = None
             done = self._emotion_after(pend[0], pend[1]) if pend else None
-            self.say(reply, on_done=done)
+            self._chat_reply_out(reply, on_done=done)
             return
         self.busy = True
         # 思考中形象：API 等待期间显示 thinking.png（缺图自动回退待机）
@@ -2190,7 +2197,7 @@ class PetWindow(QWidget):
         pend = getattr(self, "_pending_emotion", None)
         self._pending_emotion = None
         done = self._emotion_after(pend[0], pend[1]) if pend else None
-        self.say(content, on_done=done)
+        self._chat_reply_out(content, on_done=done)
         self._maybe_request_summary()      # 聊天结束后再考虑压缩，避免并发两次请求
         self._maybe_summarize_chat_mood()  # 设置开启时：攒够了就请 AI 总结一次情绪
 
@@ -2264,7 +2271,7 @@ class PetWindow(QWidget):
             self.history.append({"role": "assistant", "content": reply})
             self._trim_history()
             append_log("assistant", reply)
-            self.say(reply, split=False)
+            self._chat_reply_out(reply)
             self._update_mode_label()
             return
         # API 故障时用本地保底引擎回应最后一句，保证对话不断线
@@ -2278,12 +2285,14 @@ class PetWindow(QWidget):
         self.history.append({"role": "assistant", "content": reply})
         self._trim_history()
         append_log("assistant", reply)
-        self.say(reply, split=False)
+        self._chat_reply_out(reply)
 
     # ---------- 隐藏指令（26.彩蛋） ----------
     def _handle_command(self, text):
         cmd = text[1:].strip()
-        if cmd.startswith("好感"):
+        if cmd.startswith("聊天窗口") or cmd.startswith("窗口"):
+            self.open_chat_window()
+        elif cmd.startswith("好感"):
             lv = self._aff_level_name()
             self.say("当前好感度 {}（{}）～{}".format(self.affinity, lv[1], lv[2]), split=False)
         elif cmd.startswith("硬币") or cmd.startswith("金币"):
@@ -3180,6 +3189,7 @@ class PetWindow(QWidget):
 
         # 对话
         m_talk = menu.addMenu("💬 对话")
+        m_talk.addAction("🖥 聊天窗口（⇄ 气泡模式）").triggered.connect(self.open_chat_window)
         m_talk.addAction("和麟说说话").triggered.connect(lambda: self.input.setFocus())
         m_talk.addAction("📖 角色介绍").triggered.connect(lambda: self.say(PROFILE_TEXT))
         m_talk.addAction("🕘 历史记录").triggered.connect(self.open_history)
@@ -3276,6 +3286,76 @@ class PetWindow(QWidget):
         menu.exec_(event.globalPos())
 
     # ---------- 菜单动作实现 ----------
+    # ---------- 聊天窗口（与桌宠气泡自由切换） ----------
+    def open_chat_window(self):
+        """打开/召回聊天窗口。任何内部异常都要让麟说出来——绝不"点了没反应"。"""
+        try:
+            self._open_chat_window_impl()
+        except Exception as e:
+            print("[open_chat_window]", e)
+            try:
+                self.say("唔…聊天窗口打不开（{}）。跟幸歌说一声，马上修！".format(e), split=False)
+            except Exception:
+                pass
+
+    def _open_chat_window_impl(self):
+        """聊天窗口模式：开着时对话回复显示在窗口里（桌宠不打字泡），关掉自动
+        回到气泡模式——"自由切换"就是开关这个窗口。非模态 + 原生标题栏三键，
+        最小化后任务栏可召回（与音乐播放器同款管理方式）。"""
+        dlg = getattr(self, "_chat_dlg", None)
+        if dlg is not None:
+            dlg.showNormal()
+            dlg.raise_()
+            dlg.activateWindow()
+            self._fit_dialog_to_screen(dlg)
+            self._pin_pet(False)
+            QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+            return
+        dlg = ChatWindow(self)
+        self._chat_dlg = dlg
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+        try:
+            dlg.load_history(self.history)
+        except Exception as e:
+            print("[聊天窗口] 装载历史失败", e)
+
+        def _closed(*_):
+            if getattr(self, "_chat_dlg", None) is dlg:
+                self._chat_dlg = None
+                self._pin_pet(True)   # 切回气泡模式，桌宠置顶恢复
+
+        dlg.finished.connect(_closed)
+        dlg.destroyed.connect(_closed)
+        self._fit_dialog_to_screen(dlg)
+        self._pin_pet(False)
+        dlg.show()
+        QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+        self._force_taskbar_button(dlg)
+
+    def _chat_window_active(self):
+        dlg = getattr(self, "_chat_dlg", None)
+        return dlg is not None and dlg.isVisible()
+
+    def _chat_window_append(self, role, text):
+        if not self._chat_window_active():
+            return
+        try:
+            self._chat_dlg.append_message(role, text)
+        except Exception as e:
+            print("[聊天窗口] 追加消息失败", e)
+
+    def _chat_reply_out(self, text, on_done=None):
+        """聊天回复的唯一出口：窗口模式显示在窗口里（表情回调立即执行，
+        不用等打字机）；气泡模式照常 say()。其它类型的气泡（随机事件/
+        主动关心/音乐提示）不走这里，不受影响。"""
+        if self._chat_window_active():
+            self._chat_window_append("assistant", text)
+            if on_done:
+                on_done()
+        else:
+            self.say(text, on_done=on_done)
+
     def open_history(self):
         self._exec_dialog(HistoryDialog(self))
 
