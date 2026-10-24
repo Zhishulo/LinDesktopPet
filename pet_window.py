@@ -6,11 +6,12 @@ import sys
 import re
 import json
 import time
+import socket
 import datetime
 import random
 import threading
-import subprocess
 import webbrowser
+import ctypes
 
 # ===== 修复 Qt 找不到平台插件（中文路径常见问题）=====
 import PyQt5
@@ -33,41 +34,159 @@ else:
     winsound = None
 
 from PyQt5.QtCore import (Qt, QTimer, QPropertyAnimation, QEasingCurve,
-                          QPoint, QEvent)
+                          QPoint, QEvent, pyqtSignal)
 from PyQt5.QtGui import QPixmap, QFont, QIcon
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QMenu, QLineEdit,
                              QPushButton, QHBoxLayout, QVBoxLayout, QFrame,
                              QGraphicsOpacityEffect, QProgressBar, QDialog,
-                             QMessageBox)
+                             QSystemTrayIcon)
 
 from config import *   # 全部常量（图片路径/人设/台词/商城/天气/记忆参数）
 from data import (data_dir, resource_path, load_json, save_json, load_api_key,
                   save_api_key, load_log, save_log, append_log,
                   ensure_data_files, load_memory, save_memory, load_settings)
-from api_client import (SignalBus, ask_llm, load_api_config, save_api_config,
-                        ask_api_key_once)
+from api_client import (SignalBus, ask_llm, load_api_config, save_api_config)
+from context_budget import ContextBudget     # 上下文预算 + 滚动摘要（纯 stdlib，不依赖 Qt）
+import listening                             # 听歌状态机（纯 stdlib，不依赖 Qt/winrt）
+import care                                  # 情绪察觉 + 主动关心（纯 stdlib，只读心情/评测）
+import music_folder                          # 本地音乐播放器（QMediaPlayer，主线程）
 from local_brain import local_reply as _local_reply
 from memory import memory_log_dir, write_daily_log, extract_facts_local
 from mood import (load_moods, save_moods, recent_records, NEGATIVE_KEYS,
                   mood_name, mood_reply, pick_warm_word)
 from assessment import recent_assessment
 from widgets import BubbleLabel, PetLabel
+from crash_guard import install as install_crash_guard
 from dialogs import (HistoryDialog, HelpDialog, MemoryDialog, PersonaDialog,
                      ProfileDialog, FocusDialog, BackpackDialog, ScheduleDialog,
-                     EventDialog, RPSDialog, DiceDialog, OrganizeDialog,
+                     RPSDialog, DiceDialog, OrganizeDialog,
                      NoteDialog, ShopDialog, ApiEditDialog, ApiManagerDialog,
                      SettingsDialog, MoodRecordDialog, MoodHistoryDialog,
                      MoodStatsDialog, CrisisSupportDialog, AssessmentDialog,
-                     AssessmentHistoryDialog)
+                     AssessmentHistoryDialog, MusicPlayerDialog)
+class _EventOverlay(QFrame):
+    """随机事件选项条：pet 窗口内的普通子控件，不是独立窗口。
+
+    旧版用 EventDialog（QDialog 顶层窗口）。就算设了 NonModal +
+    WA_ShowWithoutActivating，它仍然是一个独立窗口：父窗口激活时系统会把它
+    当成可接收首键的窗口，用户随手敲的 Enter/Esc 就把它关掉，表现出来就是
+    「弹窗一闪而过、打字被打断」。
+    改成子控件之后根本不存在可抢焦点的窗口：键盘焦点永远留在原来获得焦点的
+    控件上；两个按钮都是 NoFocus，Enter/Esc 也不会误触（旧版 QDialog 里
+    QPushButton 默认 autoDefault，Enter 会直接替用户选了 A）。
+    """
+
+    # 用户选择后发出：'a' / 'b'；超时或外部取消时发 ''。
+    finished = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("event_overlay")
+        self.setFocusPolicy(Qt.NoFocus)
+        # 下面这个属性对子控件本身不生效（只对窗口有意义），保留是为了让
+        # 「事件条不激活窗口」的意图在代码里可读、可检索。
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.chosen = None
+        self._timed_out = False
+        self._shown = False        # 事件条自身的展示状态（与父窗口可见性解耦）
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(4)
+        self.title_lab = QLabel("", self)
+        self.title_lab.setWordWrap(True)
+        self.title_lab.setFocusPolicy(Qt.NoFocus)
+        self.text_lab = QLabel("", self)
+        self.text_lab.setWordWrap(True)
+        self.text_lab.setFocusPolicy(Qt.NoFocus)
+        brow = QHBoxLayout()
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.setSpacing(6)
+        self.btn_a = QPushButton("A", self)
+        self.btn_b = QPushButton("B", self)
+        for b in (self.btn_a, self.btn_b):
+            # 关键：按钮不吃键盘焦点，Enter 不会误触，Tab 也进不来
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setCursor(Qt.PointingHandCursor)
+        self.btn_a.clicked.connect(lambda: self._pick("a"))
+        self.btn_b.clicked.connect(lambda: self._pick("b"))
+        brow.addWidget(self.btn_a, 1)
+        brow.addWidget(self.btn_b, 1)
+        lay.addWidget(self.title_lab)
+        lay.addWidget(self.text_lab, 1)
+        lay.addLayout(brow)
+
+    def show(self):
+        """展示：只在 pet 窗口内部浮到最上层，不涉及任何顶层窗口。"""
+        self._shown = True
+        super().show()
+        self.raise_()
+
+    def hide(self):
+        self._shown = False
+        super().hide()
+
+    def isVisible(self):
+        """事件条是否处于「展示中」。
+
+        子控件的 Qt isVisible() 还要求父窗口可见；事件条是否在展示与父窗口
+        是否已显示是两件事（启动早期/无头测试里父窗口可能还没 show），
+        所以这里按自身展示状态回答，避免调用方误判成「没弹出来」。
+        """
+        return self._shown
+
+    def load(self, ev):
+        """把一条事件填进控件（不负责显示）。"""
+        self.chosen = None
+        self._timed_out = False
+        self.title_lab.setText("✨ " + str(ev.get("title") or "小事件"))
+        self.text_lab.setText(str(ev.get("text") or ""))
+        self.btn_a.setText("A. " + str(ev.get("a") or "…"))
+        self.btn_b.setText("B. " + str(ev.get("b") or "…"))
+
+    def _pick(self, key):
+        if self.chosen is not None or not self.isVisible():
+            return
+        self.chosen = key
+        self.hide()
+        self.finished.emit(key)
+
+    def timeout(self):
+        """60 秒没人理：静默收起，不算用户做了选择。"""
+        if not self.isVisible():
+            return
+        self._timed_out = True
+        self.chosen = None
+        self.hide()
+        self.finished.emit("")
+
+    def reject(self):
+        """兼容 QDialog.reject() 的语义（外部/测试代码可能直接调用）：静默收起。"""
+        self._timed_out = True
+        self.chosen = None
+        self.hide()
+        self.finished.emit("")
+
+
 class PetWindow(QWidget):
+    # 主人「正忙着」的阈值：最近 20 秒内有键鼠输入（本应用或其他程序）就不打扰
+    BUSY_INPUT_SECONDS = 20
+
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        # ---- 自定义配置（settings.json，自动兼容旧档） ----
+        self.settings = load_settings()
+        # 置顶可关（设置面板里的勾选框）：默认置顶，免得桌宠被别的窗口压住；
+        # 但打开面板时会临时让位，见 _pin_pet / _exec_dialog。
+        self._always_on_top = bool(self.settings.get("always_on_top", True))
+        self._dialog_depth = 0
+        self._topmost_now = None
+        _flags = Qt.FramelessWindowHint | Qt.Tool
+        if self._always_on_top:
+            _flags |= Qt.WindowStaysOnTopHint
+        self.setWindowFlags(_flags)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("丰裕之角桌宠 - 麟")
         self.setFixedSize(340, 562)
-        # ---- 自定义配置（settings.json，自动兼容旧档） ----
-        self.settings = load_settings()
         self.scale = max(0.4, min(1.5, float(self.settings.get("pet_scale", 100)) / 100.0))
         self.idle_timeout = int(self.settings.get("chat_interval", 1200))
         self.event_min = max(1, int(self.settings.get("event_min", 30))) * 60
@@ -192,6 +311,12 @@ class PetWindow(QWidget):
         ch.addWidget(b2)
         self.clip_overlay.hide()
 
+        # ---- 随机事件选项条（pet 窗口内嵌覆盖层，不是弹窗）----
+        self.event_overlay = _EventOverlay(self)
+        self.event_overlay.setGeometry(10, 170, 320, 122)
+        self.event_overlay.hide()
+        self.event_overlay.finished.connect(self._on_event_overlay_finished)
+
         # ---- 状态数据 ----
         self.economy = load_json("economy.json", {"coins": 100, "last_checkin": "", "outfits": [],
                                                   "affinity": 0, "mood": 60, "current_outfit": ""})
@@ -220,6 +345,14 @@ class PetWindow(QWidget):
 
         self.busy = False
         self.history = []
+        # 滚动摘要 + 按 token 预算裁剪；持久化在 chat_context.json（与 memory.json 互不影响）。
+        # 即使 CONTEXT_BUDGET_ENABLED=False 也保留这个对象：它只是状态容器，不会主动做任何事。
+        self.ctx = ContextBudget().load()
+        self._summary_pending = False       # 摘要请求在途标记，避免重复发
+        # 听歌感知：每 15 秒采样一次「系统正在播放什么」，再决定要不要搭话
+        self.listener = listening.ListenTracker()
+        self._listen_warm = False           # now_playing 是否已在后台线程预热过
+        self._listen_loading = False        # 预热线程是否在跑
         self._fade_anim = None
         self._shake_anim = None
         self._grav_anim = None
@@ -240,6 +373,7 @@ class PetWindow(QWidget):
         self.focus_minutes = 0
         self.sleep_mode = False
         self.forced_sleep = False
+        self.manual_awake = False     # #醒 强行叫醒：夜间也不再自动睡回去
         self.game_mode = False
         self._pre_game_pos = None
         self.net_ok = True
@@ -253,8 +387,18 @@ class PetWindow(QWidget):
         self._last_wx_msg = time.time()
         self._last_chime_hour = -1
         self.thunder_mode = False          # 雷雨天气害怕待机
-        self.music_mode = False            # 听歌陪伴模式
-        self.music_end = 0
+        self.music_mode = False            # 音乐播放中（播放器或八音盒）
+        self.music_end = 0                 # 播放截止时间戳；0 = 不限时（手动停/睡/游戏/退出才停）
+        self._music_player = None          # 八音盒播放器（music_box.MusicPlayer，降级后备）
+        self._mf_player = None             # 本地音乐播放器（music_folder.MusicFolderPlayer）
+        self._music_dlg = None             # 音乐面板（非模态；None=没开，hidden=最小化中）
+        self._music_started_at = 0.0       # 起播时刻（clock_tick 收尾判断的宽限期基准）
+        self._event_defer = 0              # 随机事件弹窗因用户忙碌被推迟的次数
+        self._event_created_at = 0.0       # 当前待展示事件的生成时刻（0=未知）
+        self._event_dlg = None             # 正在展示的随机事件小窗
+        self._help_dlg = None              # 帮助窗（非模态，只开一个）
+        self._api_kind = None              # 最近一次 API 请求的类型（chat/event/food/memory）
+        self._offline_hinted = False       # 是否已提示过「没配 Key，正在离线保底」
         self._pending_emotion = None       # 回复完成后要播的表情
         self._say_done_cb = None           # say() 完成回调
         self._emotion_file = None          # 当前一次性表情帧
@@ -270,12 +414,13 @@ class PetWindow(QWidget):
         # ---- 信号 ----
         self.bus = SignalBus()
         self.bus.reply_ready.connect(self._on_reply, Qt.QueuedConnection)
-        self.bus.reply_error.connect(self._on_api_error, Qt.QueuedConnection)
+        self.bus.reply_error_kind.connect(self._on_api_error_kind, Qt.QueuedConnection)
         self.bus.event_ready.connect(self._on_event, Qt.QueuedConnection)
         self.bus.food_ready.connect(self._on_food, Qt.QueuedConnection)
         self.bus.memory_ready.connect(self._on_memory, Qt.QueuedConnection)
         self.bus.weather_ready.connect(self._on_weather, Qt.QueuedConnection)
         self.bus.ping_ready.connect(self._on_ping, Qt.QueuedConnection)
+        self.bus.summary_ready.connect(self._on_summary, Qt.QueuedConnection)   # 滚动摘要回填
 
         self.send_btn.clicked.connect(self.send_message)
         self.input.returnPressed.connect(self.send_message)
@@ -354,6 +499,36 @@ class PetWindow(QWidget):
         self.event_timer.timeout.connect(self._event_tick)
         self.event_timer.start()
 
+        self.listen_timer = QTimer(self)         # 听歌感知：每 15 秒看一眼在放什么
+        self.listen_timer.setInterval(15000)
+        self.listen_timer.timeout.connect(self._listen_tick)
+        self.listen_timer.start()
+        # winrt 首次加载 ~110ms，放到后台线程预热；用户 3 秒后才被采样
+        QTimer.singleShot(3000, self._start_listen_warm)
+
+        # 主动关心：只读 mood.json / assessment.json（不评判、没有对错），
+        # 每 10 分钟看一眼；真说话前还要过 care 自己的 3 小时冷却 + 12 小时同状态冷却。
+        self.care = care.CareTracker()
+        self._care_analysis_until = 0.0   # 主人点了「一起分析」后的 30 分钟内，回复走陪伴分析口径
+        self.care_timer = QTimer(self)
+        self.care_timer.setInterval(10 * 60 * 1000)
+        self.care_timer.timeout.connect(self._care_tick)
+        self.care_timer.start()
+        QTimer.singleShot(45000, self._care_tick)   # 启动 45 秒后先看一眼（不打扰启动）
+
+        # 随机事件覆盖层的两个一次性定时器（单条链，不会堆积）：
+        # - retry：主人忙时推迟重试
+        # - auto ：60 秒没人理就静默收起
+        self._event_retry_timer = QTimer(self)
+        self._event_retry_timer.setSingleShot(True)
+        self._event_retry_timer.setInterval(20000)
+        self._event_retry_timer.timeout.connect(self._show_event_dialog)
+
+        self._event_auto_timer = QTimer(self)
+        self._event_auto_timer.setSingleShot(True)
+        self._event_auto_timer.setInterval(60000)
+        self._event_auto_timer.timeout.connect(self._auto_close_event)
+
         self.activity_timer = QTimer(self)       # 无操作闲聊陪伴
         self.activity_timer.setInterval(10000)
         self.activity_timer.timeout.connect(self._idle_activity_check)
@@ -375,6 +550,7 @@ class PetWindow(QWidget):
         QTimer.singleShot(3000, self._weather_check)
         QTimer.singleShot(6000, self._ping_check)
         QTimer.singleShot(2000, self._startup_memory)
+        QTimer.singleShot(4500, self._prewarm_music_audio)
 
     # ---------- 图片 ----------
     def _pet_pix(self, pix):
@@ -521,6 +697,10 @@ class PetWindow(QWidget):
         self.net_label.setGeometry(int(288 * s), int(128 * s), int(32 * s), int(32 * s))
         self.umbrella_label.setGeometry(int(120 * s), int(250 * s), int(200 * s), int(240 * s))
         self.clip_overlay.setGeometry(int(6 * s), int(122 * s), int(328 * s), int(44 * s))
+        # 事件覆盖层放在桌宠本体区域中部，绝不下探到底部输入框（y≈in_y）
+        ov_h = int(max(92, 122 * s))
+        self.event_overlay.setGeometry(int(10 * s), int(170 * s),
+                                       int(320 * s), ov_h)
         # 底部相对布局：输入框（高度下限 22px）→ 状态行（高度下限 16px）
         in_h = int(max(22, 30 * s))
         in_y = H - in_h - max(2, int(4 * s))
@@ -540,6 +720,22 @@ class PetWindow(QWidget):
         self.focus_label.setStyleSheet(status_style("#ffe9c9"))
         self.weather_label.setStyleSheet(status_style("#ffffff"))
         self.mode_label.setStyleSheet(status_style("#ffe9c9"))
+        # 事件覆盖层：外框 + 普通标签 + 两个选项按钮，字号随缩放
+        self.event_overlay.setStyleSheet(
+            "QFrame#event_overlay {{ background: rgba(30,20,14,238);"
+            " border: 1px solid rgba(214,170,120,120); border-radius: {}px; }}"
+            "QLabel {{ color: #fff6ea; background: transparent; font-size: {}px; }}"
+            .format(max(4, int(round(10 * s))), max(9, int(round(12 * s)))))
+        self.event_overlay.title_lab.setStyleSheet(
+            "color: #ffe9c9; background: transparent; font-size: {}px; font-weight: bold;"
+            .format(max(9, int(round(13 * s)))))
+        for _ovb in (self.event_overlay.btn_a, self.event_overlay.btn_b):
+            _ovb.setStyleSheet(
+                "QPushButton {{ background: #8c5a3c; color: #ffffff; border: none;"
+                " border-radius: {}px; padding: {}px {}px; font-size: {}px; }}"
+                "QPushButton:hover {{ background: #b58155; }}"
+                .format(max(4, int(round(8 * s))), max(1, int(round(3 * s))),
+                        max(4, int(round(10 * s))), max(9, int(round(12 * s)))))
         # 输入框与发送按钮字体随缩放
         self.input.setStyleSheet(
             "QLineEdit {{ background: transparent; border: none; color: #ffffff; font-size: {}px; }}"
@@ -710,8 +906,17 @@ class PetWindow(QWidget):
             self.say("（麟注意到你最近心情有些沉重……）幸歌，如果愿意的话，"
                      "可以跟麟说说，或者用 #情绪 记录一下今天的感觉，麟都会陪着你的。")
 
-    # ---------- Prompt 构建（人设 + 档案 + 心情 + 好感 + 天气） ----------
+    # ---------- Prompt 构建（稳定段进 system；易变段拼到本轮 user 尾部） ----------
     def build_system_prompt(self):
+        """只返回「稳定段」→ 作为唯一的 system 消息，逐字不变才能命中前缀缓存。
+
+        稳定段（按「几乎不变 → 偶尔变」排序）：
+            御主档案 → 人设 → 睡眠段 → 排版规范 → 麟的记忆
+        易变段一律不放这里（见 build_volatile_prompt）：
+            天气 / 幸歌情绪记录 / 心理评测 / 当前情绪 / 好感度 / 日期 / 在听什么
+        原因：好感度每轮 add_affinity(1) 都会变，它后面的一切（记忆、日期、
+        全部 history）都会被挤出缓存前缀。拆开后 system 整段稳定。
+        """
         prof = self.profile
         parts = []
         if prof and any(prof.values()):
@@ -724,18 +929,20 @@ class PetWindow(QWidget):
         parts.append("【排版规范】当你需要输出较长内容（讲述故事、倾诉、详细解释）时："
                      "按3~4个短句为一段，段与段之间只用单个换行；单句尽量不超过40字；"
                      "禁止超长无换行的句子与连续符号。短句日常对话保持简洁即可。")
-        mood_txt = {"happy": "心情很好，说话要更活泼开朗",
-                    "normal": "心情平稳",
-                    "sad": "心情低落，回答要简短、带一点没精神的感觉"}[self.mood]
-        parts.append("【当前情绪】{}（数值{}）。{}".format(mood_txt, self.mood_value,
-                                                       "悲伤情绪下句子控制在30字内。" if self.mood == "sad" else ""))
-        lv = self._aff_level_name()
-        parts.append("【好感度】当前好感{}，关系等级：{}（{}）。".format(self.affinity, lv[1], lv[2]))
-        if self.weather:
-            parts.append("【当前天气】{}".format(self.weather))
         mem_seg = self._memory_prompt_segment()
         if mem_seg:
             parts.append(mem_seg)
+        return "\n".join(x for x in parts if x)
+
+    def build_volatile_prompt(self):
+        """只返回「易变段」：由 _build_chat_messages 拼到本轮最后一条 user 消息尾部。
+
+        注意：只拼进「发给 API 的那一份副本」，绝不写回 self.history，
+        也不进 chat_log.json —— 否则下一轮的缓存前缀会跟着变，白拆。
+        """
+        parts = []
+        if self.weather:
+            parts.append("【当前天气】{}".format(self.weather))
         # 心理陪伴：注入幸歌最近的情绪记录，让回复更有温度
         moods = load_moods()
         recs = moods.get("records", [])[-3:]
@@ -753,7 +960,35 @@ class PetWindow(QWidget):
             parts.append("【幸歌最近的心理评测】{}（{}分，满分{}）。请温和共情、不评判不说教；"
                          "若得分较高，可温柔建议其照顾好自己，必要时寻求专业帮助。".format(
                              asm.get("scale_name", ""), asm.get("total", 0), asm.get("max", 0)))
+        mood_txt = {"happy": "心情很好，说话要更活泼开朗",
+                    "normal": "心情平稳",
+                    "sad": "心情低落，回答要简短、带一点没精神的感觉"}[self.mood]
+        parts.append("【当前情绪】{}（数值{}）。{}".format(
+            mood_txt, self.mood_value,
+            "悲伤情绪下句子控制在30字内。" if self.mood == "sad" else ""))
+        lv = self._aff_level_name()
+        parts.append("【好感度】当前好感{}，关系等级：{}（{}）。".format(self.affinity, lv[1], lv[2]))
         parts.append("【今天】现在是{}。".format(time.strftime("%Y年%m月%d日 %A")))
+        # 听歌感知：只有真听到东西时才多出这一段；没有音乐时返回空串，
+        # 保证「没听歌」场景下每轮的 volatile 段仍然一致（不额外破坏缓存）。
+        try:
+            seg = self.listener.prompt_segment()
+        except Exception:
+            seg = ""
+        if seg:
+            parts.append(seg)
+        # 情绪察觉：只有 readme 说的「看得到情绪信号」时才追加；正常返回空串，
+        # 保证没问题时每轮 volatile 一致（不破坏前缀缓存）。
+        try:
+            care_seg = self.care.prompt_segment()
+        except Exception:
+            care_seg = ""
+        if self._care_analysis_until > time.time():
+            care_seg += ("\n【此刻幸歌想一起分析】他已经答应了。请用开放提问陪他梳理："
+                         "发生了什么、当时的感受、需要什么、下次想怎么照顾自己；"
+                         "不要下结论、不要评判对错、不要替他贴标签。")
+        if care_seg:
+            parts.append(care_seg)
         return "\n".join(x for x in parts if x)
 
     def _memory_prompt_segment(self):
@@ -768,6 +1003,97 @@ class PetWindow(QWidget):
             return ""
         return ("【麟的记忆】以下是你和幸歌过往相处中记住的事，对话时可以自然引用，"
                 "但不要假装是刚刚发生的：\n" + "\n".join(segs))
+
+    def build_full_system_prompt(self):
+        """稳定段 + 易变段合成一条 system：只在 CONTEXT_BUDGET_ENABLED=False 时退回旧行为用"""
+        vol = self.build_volatile_prompt()
+        base = self.build_system_prompt()
+        return (base + "\n" + vol) if vol else base
+
+    def _build_chat_messages(self, history=None):
+        """构建一次聊天请求，返回 (msgs, dropped)。
+
+        开预算：system=稳定段；易变段拼到「本轮最后一条 user 的副本」尾部；
+                再由 ContextBudget 按 token 预算裁剪旧历史（dropped=没发出去的条数）。
+        关预算：完全退回旧行为（一条 system=稳定段+易变段，全量 history）。
+        """
+        hist = self.history if history is None else history
+        if not CONTEXT_BUDGET_ENABLED or self.ctx is None:
+            return ([{"role": "system", "content": self.build_full_system_prompt()}]
+                    + list(hist)), 0
+        system = self.build_system_prompt()
+        vol = self.build_volatile_prompt()
+        send_hist = list(hist)
+        if vol and send_hist and send_hist[-1].get("role") == "user":
+            last = dict(send_hist[-1])
+            txt = str(last.get("content", ""))
+            # 先按截断上限给易变段留位置，否则超长提问会把易变段截掉
+            room = max(80, int(MAX_MSG_CHARS) - len(vol) - 2)
+            if len(txt) > room:
+                txt = txt[:room].rstrip() + "…"
+            last["content"] = (txt + "\n\n" + vol).strip()
+            send_hist[-1] = last
+        return self.ctx.build_messages(system, send_hist)
+
+    def _trim_history(self):
+        """历史条数的硬上限只防「极端长跑」；真正的裁剪由 ContextBudget 按预算做。
+
+        裁掉最旧的 N 条时必须把摘要的 covered 同步减 N，
+        否则「已覆盖条数」会和 self.history 错位（导致摘要漏消息或重复摘要）。
+        """
+        limit = int(HISTORY_MAX_MESSAGES)
+        if limit <= 0 or len(self.history) <= limit:
+            return
+        removed = len(self.history) - limit
+        self.history = self.history[-limit:]
+        if self.ctx is not None:
+            try:
+                self.ctx.covered = max(0, int(self.ctx.covered) - removed)
+            except Exception:
+                pass
+
+    def _maybe_request_summary(self):
+        """攒够旧消息、且历史真会超预算时，异步请模型把旧对话压成滚动摘要。
+
+        触发条件（ContextBudget.should_summarize，参数顺序是 history 在前）：
+          1) 最近窗口之外还有 >= CONTEXT_SUMMARY_EVERY 条没进摘要的旧消息；
+          2) 全部历史一起发会超预算（dropped > 0）。
+        失败/超时/没 Key 一律静默：只影响「记性」，绝不影响聊天主流程。
+        """
+        if not CONTEXT_BUDGET_ENABLED or self.ctx is None:
+            return
+        if self._summary_pending or not self._has_api_key():
+            return
+        if self.busy:
+            return          # 别和正在进行的聊天抢连接
+        try:
+            if not self.ctx.should_summarize(self.history, self.build_system_prompt()):
+                return
+            old = self.ctx.summary_slice(self.history)
+        except Exception as e:
+            print("[上下文摘要] 跳过", e)
+            return
+        if not old:
+            return
+        self._summary_pending = True
+        try:
+            ask_llm(self.ctx.make_summary_prompt(old), self.bus,
+                    kind="summary", temperature=0.3, max_tokens=600)
+        except Exception as e:
+            self._summary_pending = False
+            print("[上下文摘要] 请求失败", e)
+
+    def _on_summary(self, content):
+        """收到滚动摘要：回填 + 落盘 chat_context.json；任何异常都静默"""
+        self._summary_pending = False
+        if not CONTEXT_BUDGET_ENABLED or self.ctx is None:
+            return
+        try:
+            covered = self.ctx.covered_target(self.history)
+            if not self.ctx.apply_summary(content, covered):
+                print("[上下文摘要] 空摘要，忽略")
+        except Exception as e:
+            print("[上下文摘要] 回填失败", e)
 
     # ---------- 记忆系统（每天写日志，越用越懂使用者） ----------
     def _mem_dir(self):
@@ -1227,17 +1553,390 @@ class PetWindow(QWidget):
             self.pose = "idle"
             self._show(self._idle_file())
 
-    # ---------- 听歌陪伴模式（music.png，60 秒自动结束） ----------
+    # ---------- 音乐播放器（内置+导入曲库；八音盒作降级后备） ----------
+    def music_player(self):
+        """懒建本地音乐播放器（QMediaPlayer 必须在主线程建；缺 QtMultimedia 返回 None）。"""
+        if getattr(self, "_mf_player", None) is None and music_folder.is_available():
+            try:
+                self._mf_player = music_folder.MusicFolderPlayer(self)
+                self._mf_player.set_volume(int(self.settings.get("music_volume", 70)))
+                self._mf_player.set_mode(self.settings.get("music_playback", "random"))
+                self._mf_player.restore_all(keep_title=self.settings.get("music_last_title", ""))
+                self._mf_player.trackChanged.connect(self._on_mf_track)
+                self._mf_player.modeChanged.connect(self._on_mf_mode)
+                self._mf_player.playerError.connect(
+                    lambda m: self.say(m, split=False))
+            except Exception as e:
+                print("[music_player]", e)
+                self._mf_player = None
+        return self._mf_player
+
+    def _on_mf_track(self, idx, title, source):
+        """记住上次放的歌，下次启动自动接着它播（存进 settings.json）。"""
+        try:
+            self.settings["music_last_title"] = title
+            save_json("settings.json", self.settings)
+        except Exception:
+            pass
+
+    def _on_mf_mode(self, key):
+        try:
+            self.settings["music_playback"] = key
+            save_json("settings.json", self.settings)
+        except Exception:
+            pass
+
     def start_music(self):
+        """开始放音乐。任何内部异常都要让麟说出来——绝不"点了没反应"。"""
+        try:
+            self._start_music_impl()
+        except Exception as e:
+            print("[start_music]", e)
+            try:
+                self.say("唔…麟的琴坏了放不出歌（{}）。跟幸歌说一声，马上修！".format(e), split=False)
+            except Exception:
+                pass
+
+    def _start_music_impl(self):
+        """开始放音乐：优先本地播放器（不限时），缺 QtMultimedia 回落八音盒 60 秒。"""
         if self.sleep_mode:
             self.say("呼噜…Zzz…（麟睡着了，听不了歌啦。输入 #醒 叫醒我）", split=False)
             return
         if self.game_mode:
-            self.say("嘘…麟正缩在角落里，不敢出声…", split=False)
+            self.say("麟检测到你在打游戏，缩在角落里不敢出声…关掉游戏就能放歌啦", split=False)
             return
+        mf = self.music_player()
+        if mf is not None:
+            if not mf.tracks():
+                self.say("麟的曲库还是空的！把歌拖进 exe 旁边的 music 文件夹，"
+                         "或打开「🎵 音乐播放器」点「📥 导入音乐」～", split=False)
+                return
+            self.music_mode = True
+            self.music_end = 0        # 0 = 不限时，手动停/入睡/进游戏/退出才停
+            self._music_started_at = time.time()   # clock_tick 收尾判断的 3 秒宽限期
+            if not mf.is_playing():
+                mf.play(self.settings.get("music_last_title") or None)
+            cur = mf.current_track()
+            name = cur["title"] if cur else "你的歌"
+            self.say("好呀～麟放歌给你听：《{}》♪".format(name), split=False)
+            return
+        # 降级路径：没有 QtMultimedia（老机器/精简环境）→ 八音盒，保留 60 秒旧行为
         self.music_mode = True
         self.music_end = time.time() + 60
-        self.say("好呀～麟陪你听 60 秒的歌！", split=False)
+        self._music_started_at = time.time()
+        if self._start_music_audio():
+            self.say("好呀～麟给你播 60 秒的八音盒～", split=False)
+        else:
+            self.say("好呀～麟陪你安静待 60 秒…（这台电脑放不出声音，麟就在旁边陪你）", split=False)
+
+    def open_music_panel(self):
+        """打开播放器面板。任何内部异常都要让麟说出来——绝不"点了没反应"。"""
+        try:
+            self._open_music_panel_impl()
+        except Exception as e:
+            print("[open_music_panel]", e)
+            try:
+                self.say("唔…音乐面板打不开（{}）。跟幸歌说一声，马上修！".format(e), split=False)
+            except Exception:
+                pass
+
+    def _open_music_panel_impl(self):
+        """打开播放器面板；最小化中的面板直接召回；还没在放歌就先起播。
+
+        面板是非模态窗口（开着也能操作桌宠本体），有自己的任务栏项。
+        窗口行为：标题栏 — 最小化到任务栏（音乐继续）、× 关闭=停歌。
+        """
+        if self.sleep_mode:
+            self.say("呼噜…Zzz…（麟睡着了，听不了歌啦。输入 #醒 叫醒我）", split=False)
+            return
+        if self.game_mode:
+            self.say("麟检测到你在打游戏，缩在角落里不敢出声…关掉游戏就能放歌啦", split=False)
+            return
+        dlg = getattr(self, "_music_dlg", None)
+        if dlg is not None:
+            # 最小化中：直接召回（音乐可能还在放，刷新一下状态即可）
+            dlg.showNormal()
+            dlg.raise_()
+            dlg._refresh_all()
+            self._fit_dialog_to_screen(dlg)
+            self._pin_pet(False)
+            QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+            return
+        mf = self.music_player()
+        if mf is None:
+            self.say("这台电脑放不了本地歌（缺多媒体组件），麟用八音盒代替啦～", split=False)
+            self.start_music_fallback()
+            return
+        if not mf.is_playing():
+            before = self.music_mode
+            self.start_music()
+            if not self.music_mode and not before:
+                return        # 曲库空/被拒：台词已经说明白了，面板就不开了
+        dlg = MusicPlayerDialog(self)
+        self._music_dlg = dlg
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_DeleteOnClose, True)   # 关闭后销毁，引用由 finished 清掉
+
+        def _panel_closed(*_):
+            if getattr(self, "_music_dlg", None) is dlg:
+                self._music_dlg = None
+                self._pin_pet(True)   # 关面板即停歌，桌宠置顶恢复
+
+        dlg.finished.connect(_panel_closed)
+        dlg.destroyed.connect(_panel_closed)
+        self._fit_dialog_to_screen(dlg)
+        self._pin_pet(False)
+        dlg.show()
+        QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+        self._force_taskbar_button(dlg)   # 最小化后在任务栏有自己的图标，一点就回来
+
+    @staticmethod
+    def _force_taskbar_button(dlg):
+        """确保播放器面板在任务栏有自己的图标（最小化后从任务栏一点就回来）。
+
+        Qt.Window 理论上不带 WS_EX_TOOLWINDOW，但保险起见用 Win32 显式
+        加 APPWINDOW、去 TOOLWINDOW；非 Windows 静默跳过。
+        """
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            hwnd = int(dlg.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW = 0x00040000
+            user32 = ctypes.windll.user32
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                  (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW)
+        except Exception as e:
+            print("[taskbar]", e)
+
+    def start_music_fallback(self):
+        """直接走八音盒降级路径（open_music_panel 专用，缺 QtMultimedia 时）。"""
+        self.music_mode = True
+        self.music_end = time.time() + 60
+        if self._start_music_audio():
+            self.say("好呀～麟给你播 60 秒的八音盒～", split=False)
+        else:
+            self.say("好呀～麟陪你安静待 60 秒…", split=False)
+
+    def stop_music(self, say_bye=True):
+        """停掉音乐（播放器 + 八音盒都停），复位立绘。幂等、可随时调。"""
+        was = self.music_mode
+        self.music_mode = False
+        self.music_end = 0
+        self._stop_music_audio()
+        if was and say_bye:
+            self.say("音乐停啦～想听再叫麟哦♪", split=False)
+        if self.pose == "music":
+            self.pose = "idle"
+            self._show(self._idle_file())
+
+    def music_next(self, say_line=True):
+        mf = self.music_player()
+        if mf is None or not mf.tracks():
+            return False
+        mf.next()
+        if say_line:
+            cur = mf.current_track()
+            if cur:
+                self.say("换这首～《{}》♪".format(cur["title"]), split=False)
+        return True
+
+    def music_prev(self):
+        mf = self.music_player()
+        if mf is None or not mf.tracks():
+            return False
+        mf.previous()
+        cur = mf.current_track()
+        if cur:
+            self.say("回到《{}》～".format(cur["title"]), split=False)
+        return True
+
+    def music_toggle(self):
+        mf = self.music_player()
+        if mf is None or not mf.tracks():
+            return False
+        mf.toggle()
+        cur = mf.current_track()
+        if mf.is_playing():
+            self.music_mode = True
+            self._music_started_at = time.time()
+            if cur:
+                self.say("继续放《{}》♪".format(cur["title"]), split=False)
+        else:
+            self.say("好，先暂停在这里～", split=False)
+        return True
+
+    def music_cycle_mode(self):
+        mf = self.music_player()
+        if mf is None:
+            return False
+        key = mf.cycle_mode()
+        self.say("播放模式换成「{}」啦～".format(mf.__class__.mode_name(key)), split=False)
+        return True
+
+    def _music_cmd(self, action):
+        """聊天命令的音乐控制统一入口：游戏模式一律拒绝。"""
+        if self.game_mode:
+            self.say("嘘…麟正缩在角落里，等打完游戏再弄音乐吧～", split=False)
+            return
+        if action == "stop":
+            self.stop_music()
+            return
+        mf = self.music_player()
+        if mf is None or not mf.tracks():
+            self.say("麟还没在放歌呢～输入 #音乐 开始吧", split=False)
+            return
+        if action == "next":
+            self.music_next()
+        elif action == "prev":
+            self.music_prev()
+        elif action == "pause":
+            mf.pause()
+            self.say("好，先暂停在这里～", split=False)
+        elif action == "resume":
+            self.music_toggle()
+        elif action == "mode":
+            self.music_cycle_mode()
+
+    def _music_box_active(self):
+        """八音盒降级路径是否还在响（clock_tick 判断音乐模式收尾用）。"""
+        try:
+            mp = getattr(self, "_music_player", None)
+            return mp is not None and mp.is_playing()
+        except Exception:
+            return False
+
+    def _prewarm_music_audio(self):
+        """后台预合成八音盒 WAV：避免第一次降级路径在 UI 线程卡半秒"""
+        try:
+            import music_box
+            if not music_box.is_available():
+                return
+            threading.Thread(target=music_box.music_file,
+                             name="LinPetMusicPrewarm", daemon=True).start()
+        except Exception:
+            pass
+
+    def _start_music_audio(self):
+        """播放八音盒：合成失败/无声卡时静默降级，绝不影响主流程"""
+        try:
+            import music_box
+            if self._music_player is None:
+                self._music_player = music_box.MusicPlayer()
+            return bool(self._music_player.play())
+        except Exception:
+            return False
+
+    def _stop_music_audio(self):
+        """停止音乐（本地播放器 + 八音盒都停；幂等，禁止抛异常）"""
+        try:
+            mf = getattr(self, "_mf_player", None)
+            if mf is not None:
+                mf.stop()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "_music_player", None) is not None:
+                self._music_player.stop()
+        except Exception:
+            pass
+
+    # ---------- 听歌感知（系统正在播放什么） ----------
+    def _start_listen_warm(self):
+        """后台线程预热 now_playing：winrt 首载 ~110ms，不能放 UI 线程"""
+        if getattr(self, "_listen_warm", False) or getattr(self, "_listen_loading", False):
+            return
+        self._listen_loading = True
+
+        def _work():
+            try:
+                import now_playing
+                now_playing.preload()          # 预建窗口枚举缓存（约 3ms）
+                now_playing.current_track()    # 触发 winrt 首次加载（约 110ms）
+            except Exception:
+                pass
+            self._listen_warm = True
+            self._listen_loading = False
+
+        threading.Thread(target=_work, name="LinPetListenWarm", daemon=True).start()
+
+    def _listen_tick(self):
+        """每 15 秒采样一次：只在「刚开始放/恢复了播放」时轻轻搭一句。
+
+        绝不打扰打字：用户 20 秒内有过键鼠输入就只更新状态、不主动说话。
+        全程吞异常，听歌感知坏掉不能影响桌宠主体。
+        """
+        if not getattr(self, "_listen_warm", False):
+            self._start_listen_warm()
+            return
+        if self.sleep_mode or self.game_mode:
+            return
+        try:
+            import now_playing
+            track = now_playing.current_track()
+        except Exception:
+            return
+        try:
+            r = self.listener.update(track)
+        except Exception:
+            return
+        if r.get("event") not in ("started", "resumed"):
+            return
+        if self._recent_input_seconds() < self.BUSY_INPUT_SECONDS:
+            return
+        try:
+            line = self.listener.greeting()
+        except Exception:
+            line = None
+        if line:
+            self.say(line)
+
+    def say_now_playing(self):
+        """#在听 / 菜单「🎧 麟在听什么」：报告此刻听到的音乐"""
+        st = ""
+        try:
+            import now_playing
+            self._listen_warm = True
+            self.listener.update(now_playing.current_track())
+            st = now_playing.status_text()
+        except Exception:
+            st = ""
+        if not st:
+            st = self.listener.status_line()
+        self.say(st, split=False)
+
+    def _care_tick(self):
+        """每 10 分钟看一眼主人的心情记录/评测：只在「主人正闲着」时轻轻关心一句。
+
+        三重闸门：①睡觉/游戏/正在聊天时不打扰；②用户 30 秒内有过键鼠输入不打扰；
+        ③care 自己还有 3 小时冷却 + 同类状态 12 小时冷却。全程吞异常。
+        """
+        try:
+            if self.sleep_mode or self.game_mode or self.busy:
+                return
+            if self._recent_input_seconds() < 30:
+                return
+            st = self.care.observe()
+            if st.get("level") == care.LEVEL_NONE:
+                return
+            line = self.care.should_care()
+            if not line:
+                return
+            self.say(line, split=False)
+            self.care.mark_cared(signature=st.get("signature"))
+        except Exception as e:
+            print("[care_tick]", e)
+
+    def say_care(self):
+        """#关心 / 菜单「💗 麟关心一下」：说说看到了什么，并邀请一起分析（不评判）"""
+        try:
+            self._care_analysis_until = time.time() + 30 * 60
+            self.say(self.care.status_line(), split=False)
+        except Exception:
+            self.say("麟在呢～要是愿意，和麟说说最近怎么样？没有对错，慢慢说就好。", split=False)
 
     # ---------- 一次性表情播放（状态机：表情高于待机，不打断说话） ----------
     def _emotion_after(self, name, duration=1.2):
@@ -1386,8 +2085,7 @@ class PetWindow(QWidget):
             return
         # 睡眠不拒收：只是语气带睡意，照样 100% 完整回复
         self.history.append({"role": "user", "content": text})
-        if len(self.history) > 20:
-            self.history = self.history[-20:]
+        self._trim_history()
         append_log("user", text)
         # 即时记住用户透露的事实（本地规则，静默保存，越用越懂）
         self._extract_facts_local(text)
@@ -1403,9 +2101,11 @@ class PetWindow(QWidget):
         # 无可用 API 时走本地保底（QQ 宠物式离线陪伴），不进入思考状态
         if not self._has_api_key():
             reply = self.local_reply(text)
+            if not self._offline_hinted:
+                self._offline_hinted = True
+                reply += "\n（麟现在用的是离线小脑～右键 → 🔌 API 管理 填上 DeepSeek 的 Key 就能联网聊天啦）"
             self.history.append({"role": "assistant", "content": reply})
-            if len(self.history) > 20:
-                self.history = self.history[-20:]
+            self._trim_history()
             append_log("assistant", reply)
             pend = getattr(self, "_pending_emotion", None)
             self._pending_emotion = None
@@ -1418,17 +2118,17 @@ class PetWindow(QWidget):
                 and self.pose in ("idle", "work", "wag"):
             self.pose = "thinking"
             self._show(IMG_THINK if os.path.exists(resource_path(IMG_THINK)) else self._idle_file())
-        msgs = [{"role": "system", "content": self.build_system_prompt()}] + self.history
+        msgs, _dropped = self._build_chat_messages()
         ask_llm(msgs, self.bus)
 
     def _on_reply(self, content):
         self.busy = False
+        self._api_kind = None
         content = (content or "").strip()
         if not content:
             content = "唔…我好像想不出来怎么说了，对不起呀幸歌。"
         self.history.append({"role": "assistant", "content": content})
-        if len(self.history) > 20:
-            self.history = self.history[-20:]
+        self._trim_history()
         append_log("assistant", content)
         if any(k in content for k in ["开心", "高兴", "喜欢", "太好了", "嘿嘿"]):
             self.update_mood(3, "对话愉快")
@@ -1438,24 +2138,55 @@ class PetWindow(QWidget):
         self._pending_emotion = None
         done = self._emotion_after(pend[0], pend[1]) if pend else None
         self.say(content, on_done=done)
+        self._maybe_request_summary()      # 聊天结束后再考虑压缩，避免并发两次请求
+
+    def _on_api_error_kind(self, err, kind):
+        """带请求类型的失败回调：只处理失败的那一件事，不牵连别的状态"""
+        self._api_kind = kind or None
+        self._on_api_error(err)
 
     def _on_api_error(self, err):
+        # 摘要请求失败：静默丢弃。注意必须早于 self.busy=False，
+        # 否则会误清掉正在进行的聊天状态，导致可以重复发送。
+        if getattr(self, "_api_kind", None) == "summary":
+            self._api_kind = None
+            self._summary_pending = False
+            print("[上下文摘要失败·静默]", err)
+            return
         self.busy = False
         print("[API 错误]", err)
-        if getattr(self, "_pending_food", None):
-            name, fb = self._pending_food
-            self._pending_food = None
-            self.say("（{}）{}".format(name, fb), split=False)
-            return
-        if getattr(self, "_pending_event", None):
-            self._pending_event = None
+        kind = getattr(self, "_api_kind", None)
+        self._api_kind = None
+        # 随机事件请求失败：此时 _pending_event 还没赋值，必须无条件解除 event_busy，
+        # 否则 _event_tick 会被永久拦住，随机事件从此静默停摆。
+        if kind == "event":
             self.event_busy = False
-            self.say("唔…事件传送失败啦，下次再玩！", split=False)
             return
-        if getattr(self, "_pending_memory", None):
+        # 喂食失败：只有确实在等食物回复时才提示兜底
+        if kind == "food":
+            if getattr(self, "_pending_food", None):
+                name, fb = self._pending_food
+                self._pending_food = None
+                self.say("（{}）{}".format(name, fb), split=False)
+            return
+        # 记忆归档失败：走本地兜底
+        if kind == "memory":
             self._memory_busy = False
-            self._local_memory_fallback()
+            if getattr(self, "_pending_memory", None):
+                self._local_memory_fallback()
             return
+        if kind is None:
+            # 兼容没有带类型的老路径（比如本地触发的 NO_KEY）
+            self.event_busy = False
+            if getattr(self, "_pending_food", None):
+                name, fb = self._pending_food
+                self._pending_food = None
+                self.say("（{}）{}".format(name, fb), split=False)
+                return
+            if getattr(self, "_pending_memory", None):
+                self._memory_busy = False
+                self._local_memory_fallback()
+                return
         if err == "NO_KEY":
             self.say("还没配置 API Key 哦～右键 → 🔌 API 管理，填好就能联网聊天啦！"
                      "（现在麟先用离线模式陪你～）", split=False)
@@ -1470,8 +2201,7 @@ class PetWindow(QWidget):
         reply = self.local_reply(last_user) if last_user else (
             "唔…好像和“丰裕之角”那边的通讯断掉了，麟先用离线模式陪你～")
         self.history.append({"role": "assistant", "content": reply})
-        if len(self.history) > 20:
-            self.history = self.history[-20:]
+        self._trim_history()
         append_log("assistant", reply)
         self.say(reply, split=False)
 
@@ -1533,9 +2263,14 @@ class PetWindow(QWidget):
         elif cmd.startswith("归档"):
             self.say("好呀，麟现在就把今天的回忆写进小本本…", split=False)
             self.archive_memory(force=True)
+        elif (cmd.startswith("关心") or cmd.startswith("聊聊") or cmd.startswith("抱抱")
+              or cmd.startswith("难受")):
+            self.say_care()
         elif cmd.startswith("帮助"):
             self.say("输入 #好感 #金币 #心情 #天气 #换装 #笔记 #喂 #睡 #醒 #尾巴 "
-                     "#挥手 #转身 #记忆 #归档 #音乐 #情绪 #评测 #寄语 #危机 #彩蛋 可以触发各种功能哦～", split=False)
+                     "#挥手 #转身 #记忆 #归档 #音乐 #播放器 #下一首 #上一首 #暂停 #停 #模式 "
+                     "#在听 #关心 #情绪 #评测 #寄语 #危机 #彩蛋 "
+                     "可以触发各种功能哦～", split=False)
         elif cmd.startswith("喂"):
             self.open_backpack()
         elif cmd.startswith("睡"):
@@ -1546,6 +2281,22 @@ class PetWindow(QWidget):
             self.start_wag(True)
         elif cmd.startswith("挥手") or cmd.startswith("打招呼"):
             self.start_wave()
+        elif cmd.startswith("在听") or cmd.startswith("听什么"):
+            self.say_now_playing()
+        elif cmd.startswith("播放器") or cmd.startswith("歌单"):
+            self.open_music_panel()
+        elif cmd.startswith("下一首") or cmd.startswith("切歌") or cmd.startswith("换一首"):
+            self._music_cmd("next")
+        elif cmd.startswith("上一首"):
+            self._music_cmd("prev")
+        elif cmd.startswith("暂停"):
+            self._music_cmd("pause")
+        elif cmd.startswith("继续"):
+            self._music_cmd("resume")
+        elif cmd == "停" or cmd.startswith("停歌") or cmd.startswith("停止"):
+            self._music_cmd("stop")
+        elif cmd.startswith("模式"):
+            self._music_cmd("mode")
         elif cmd.startswith("音乐") or cmd.startswith("听歌"):
             self.start_music()
         elif cmd.startswith("转身"):
@@ -1619,10 +2370,20 @@ class PetWindow(QWidget):
         if now.tm_hour == 23 and now.tm_min == 50 and self._last_daily_mem != today:
             self._last_daily_mem = today
             self.archive_memory(force=True)
-        # 听歌陪伴模式：期间空闲时显示 music.png，到时自动结束
+        # 音乐模式：期间空闲时显示 music.png；八音盒降级路径到点自动结束，
+        # 播放器路径不限时（music_end=0），被外部停掉（错误/停止键）时静默退出模式
         if self.music_mode:
-            if time.time() > self.music_end:
+            mf = getattr(self, "_mf_player", None)
+            if self.music_end and time.time() > self.music_end:
                 self.music_mode = False
+                self._stop_music_audio()
+                if self.pose == "music":
+                    self.pose = "idle"
+                    self._show(self._idle_file())
+            elif (mf is not None and not mf.is_playing() and not mf.is_paused()
+                  and not self._music_box_active()
+                  and time.time() - getattr(self, "_music_started_at", 0) > 3):
+                self.music_mode = False       # 播放器已停（停止键/曲终/全坏），收尾
                 if self.pose == "music":
                     self.pose = "idle"
                     self._show(self._idle_file())
@@ -1650,17 +2411,27 @@ class PetWindow(QWidget):
         self.say(line)
 
     def _beep(self, n=1):
+        """提示音放到后台线程，避免 winsound.Beep 阻塞 UI 线程造成卡顿"""
         if winsound is None:
             return
+        def _run():
+            try:
+                for _ in range(max(1, int(n))):
+                    winsound.Beep(880, 180)
+                    time.sleep(0.15)
+            except Exception:
+                pass
         try:
-            for _ in range(n):
-                winsound.Beep(880, 180)
-                time.sleep(0.15)
+            threading.Thread(target=_run, daemon=True).start()
         except Exception:
             pass
 
     def _update_daynight(self, hour):
-        natural = (hour >= 23 or hour < 7)
+        night = (hour >= 23 or hour < 7)
+        if not night:
+            self.manual_awake = False      # 到了白天，强行叫醒的标记自然失效
+        # #醒 之后夜间不再立刻睡回去，否则「醒来一秒又睡」且 #音乐 会被拒绝
+        natural = night and not self.manual_awake
         sleeping = natural or self.forced_sleep
         if sleeping and not self.sleep_mode:
             self._enter_sleep(False)
@@ -1677,6 +2448,7 @@ class PetWindow(QWidget):
                 self.say("早安，幸歌！麟睡得可香啦～（好感+2，金币+10）", split=False)
 
     def _force_sleep(self):
+        self.manual_awake = False
         self._enter_sleep(True)
 
     def _enter_sleep(self, forced):
@@ -1705,6 +2477,8 @@ class PetWindow(QWidget):
         self._sleep_pending = False
         self.forced_sleep = forced
         self.sleep_mode = True
+        self.music_mode = False          # 睡觉时结束听歌陪伴
+        self._stop_music_audio()
         self._stop_all_timers()
         self.dlg_state = "idle"
         self.bubble.hide()
@@ -1716,6 +2490,7 @@ class PetWindow(QWidget):
     def _force_wake(self):
         self._sleep_pending = False
         self.forced_sleep = False
+        self.manual_awake = True        # 用户明确要求醒来：本夜不再自动入睡
         self.sleep_mode = False
         self.pose = "idle"
         self._show(self._idle_file())
@@ -1746,10 +2521,9 @@ class PetWindow(QWidget):
             if hm == t and it.get("done") != today:
                 it["done"] = today
                 changed = True
-                self._beep(3)
-                self.raise_()
-                self.activateWindow()
-                QMessageBox.information(self, "日程提醒", "⏰ 时间到了：{}".format(it.get("event", "")))
+                # 改用气泡提醒，不再弹模态框、不再 raise_/activateWindow：
+                # 模态框会抢走焦点打断用户打字，而且随手一个按键就会让它瞬间消失。
+                self._beep(2)
                 self.add_coins(10)
                 self.add_affinity(2)
                 self.say("「{}」时间到！麟提醒你啦～（金币+10，好感+2）".format(it.get("event", "")), split=False)
@@ -1884,8 +2658,11 @@ class PetWindow(QWidget):
             pass
 
     # ---------- 22 游戏模式侦测 ----------
+    # Steam.exe 已从名单摘除：它常年在后台挂机，会被误判成"一直在打游戏"，
+    # 导致音乐播放器等全部被静默拒绝（用户实测"点了没反应"）。真正的游戏
+    # 本体都有自己的进程名；通过 Steam 启动也不例外。
     GAME_LIST = ["League of Legends.exe", "GenshinImpact.exe", "YuanShen.exe",
-                 "DOTA2.exe", "Steam.exe", "CrossFire.exe", "QQGame.exe", "valorant.exe"]
+                 "DOTA2.exe", "CrossFire.exe", "QQGame.exe", "valorant.exe"]
 
     def _game_check(self):
         if psutil is None:
@@ -1900,6 +2677,14 @@ class PetWindow(QWidget):
             self.game_mode = True
             self._pre_game_pos = self.pos()
             self._stop_all_timers()
+            self.stop_music(say_bye=False)   # 游戏开始：音乐也要停，别穿过游戏音效
+            # ping/weather 也停：进游戏前这俩各 60s/1h 一次，退出时原样恢复
+            self._game_paused_timers = (self.ping_timer, self.weather_timer)
+            for t in self._game_paused_timers:
+                try:
+                    t.stop()
+                except Exception:
+                    pass
             self.dlg_state = "idle"
             self.bubble.hide()
             self.umbrella_label.hide()
@@ -1908,6 +2693,12 @@ class PetWindow(QWidget):
             self.say("（麟轻轻缩到角落里，不敢打扰你打游戏…）", split=False)
         elif not running and self.game_mode:
             self.game_mode = False
+            for t in getattr(self, "_game_paused_timers", ()) or ():
+                try:
+                    t.start()                # QTimer.start() 用原间隔重新起跑
+                except Exception:
+                    pass
+            self._game_paused_timers = None
             if self._pre_game_pos is not None:
                 self.move(self._pre_game_pos)
                 self._pre_game_pos = None
@@ -1916,23 +2707,16 @@ class PetWindow(QWidget):
     # ---------- 21 网络延迟感知 ----------
     def _ping_check(self):
         def do():
-            ok, ms = True, 0
+            ok, ms = False, 0
             try:
-                if sys.platform == "win32":
-                    r = subprocess.run(["ping", "-n", "1", "-w", "2000", "223.5.5.5"],
-                                       capture_output=True, text=True, timeout=5)
-                    ok = (r.returncode == 0)
-                    m = re.search(r"时间[=＝](\d+)ms", r.stdout) or re.search(r"time[=＝](\d+)ms", r.stdout)
-                    if m:
-                        ms = int(m.group(1))
-                    else:
-                        m2 = re.search(r"(\d+)ms", r.stdout)
-                        if m2:
-                            ms = int(m2.group(1))
-                else:
-                    r = subprocess.run(["ping", "-c", "1", "-W", "2", "223.5.5.5"],
-                                       capture_output=True, text=True, timeout=5)
-                    ok = (r.returncode == 0)
+                # 纯 socket TCP 探测 223.5.5.5:53（阿里公共 DNS）：
+                # 不再 spawn 子进程，从根上消灭「无控制台 GUI 进程给 ping.exe
+                # 弹黑框打断游戏」的可能；TCP 握手耗时即近似网络延迟。
+                t0 = time.perf_counter()
+                s = socket.create_connection(("223.5.5.5", 53), timeout=2)
+                ms = int((time.perf_counter() - t0) * 1000)
+                s.close()
+                ok = True
             except Exception:
                 ok = False
             self.bus.ping_ready.emit(ok, ms)
@@ -2057,19 +2841,25 @@ class PetWindow(QWidget):
 
     # ---------- 14 剪贴板互动 ----------
     def _on_clipboard_changed(self):
-        cb = QApplication.clipboard()
-        if not cb.mimeData().hasText():
+        # 剪贴板是系统级回调：mimeData() 可能返回 None（系统剪贴板被占用时），
+        # 旧代码直接 .hasText() 会抛 AttributeError → 槽异常 → 进程闪退。
+        try:
+            cb = QApplication.clipboard()
+            md = cb.mimeData() if cb is not None else None
+            if md is None or not md.hasText():
+                return
+            text = cb.text() or ""
+            if not text.strip():
+                return
+            if text == getattr(self, "_last_clip", None):
+                return
+            self._last_clip = text
+            if self.sleep_mode or self.dlg_state != "idle":
+                return
+            self.clip_text = text
+            self.clip_overlay.show()
+        except Exception:
             return
-        text = cb.text() or ""
-        if not text.strip():
-            return
-        if text == getattr(self, "_last_clip", None):
-            return
-        self._last_clip = text
-        if self.sleep_mode or self.dlg_state != "idle":
-            return
-        self.clip_text = text
-        self.clip_overlay.show()
 
     def _clip_look(self):
         self.clip_overlay.hide()
@@ -2105,6 +2895,12 @@ class PetWindow(QWidget):
             return
         if self.dlg_state != "idle":
             return
+        # 主人正在打字/操作（包括在别的程序里打字）：本轮直接跳过。
+        # 旧版是先请求再拖延：既白花一次 API，又会在用户刚忙完时把攒下的事件
+        # 一次性推出来，观感就是「忽然蹦出来、又瞬间消失」。
+        # 跳过时不置 event_busy，随机事件不会因此卡死。
+        if self._recent_input_seconds() < self.BUSY_INPUT_SECONDS:
+            return
         # 概率权重：没触发就顺延到下一个周期
         if random.random() * 100 > self.event_weight:
             self.last_event_time = time.time()
@@ -2130,6 +2926,7 @@ class PetWindow(QWidget):
             ev = None
         if not ev or not ev.get("a"):
             ev = random.choice(LOCAL_EVENTS)
+        self._event_created_at = time.time()   # 用于判断「事件生成后主人又动了键鼠」
         self._pending_event = ev
         sf = self._surprised_file()
         if sf:
@@ -2140,19 +2937,87 @@ class PetWindow(QWidget):
         ev = getattr(self, "_pending_event", None)
         if ev is None:
             return
-        dlg = EventDialog(ev, self)
-        dlg.exec_()
+        # 已经有一条在展示了就不要重入（例如 _on_event 的 900ms 定时器和
+        # 推迟重试链同时到期），保证同一时刻只有一个覆盖层实例。
+        shown = getattr(self, "_event_dlg", None)
+        if shown is not None and shown.isVisible():
+            return
+        # 主人 20 秒内有过键鼠输入（本应用或别的程序）就先别打扰：
+        # 事件不丢弃，交给 _event_retry_timer 单条链重试，直到主人真的空闲。
+        # 旧版只按 last_activity 判断，而 last_activity 看不到用户在别的程序里
+        # 打字，于是判断成「不忙」→ 弹窗正好打断打字。
+        if time.time() - getattr(self, "last_activity", 0) < self.BUSY_INPUT_SECONDS:
+            self._event_defer += 1
+            if not self._event_retry_timer.isActive():
+                self._event_retry_timer.start()
+            return
+        # 事件生成之后主人又开始打字/操作（很可能是在别的程序里，本应用看不到
+        # 那种输入）也得推迟。判定窗口取「生成到现在」与阈值中的较小者：
+        # 避免把生成之前的旧输入当成新的，也保证主人停手 20 秒后必然展示。
+        created = float(getattr(self, "_event_created_at", 0) or 0)
+        if created:
+            span = min(float(self.BUSY_INPUT_SECONDS),
+                       max(0.0, time.time() - created))
+            if self._recent_input_seconds() < span:
+                self._event_defer += 1
+                if not self._event_retry_timer.isActive():
+                    self._event_retry_timer.start()
+                return
+        self._event_defer = 0
+        dlg = self.event_overlay
+        # 覆盖层是 pet 窗口内的普通子控件：没有独立顶层窗口可抢焦点，
+        # 键盘焦点始终留在原处，Enter/Esc 也碰不到它（旧版 EventDialog 是
+        # QDialog 顶层窗口，父窗口一激活它就吃首键，随手一个键就关掉）。
+        # 下面两句是「不抢焦点/不激活窗口」的语义声明：Qt.NonModal 与子控件的
+        # 天然行为一致，WA_ShowWithoutActivating 只对窗口有意义，写出来是为了
+        # 让意图可读、可检索；真正生效的是「它不是窗口」这一点。
+        # 选择/超时的回调在 __init__ 里接好了 event_overlay.finished.connect(...)，
+        # 所以这里只负责填内容并 show()。
+        dlg.setWindowModality(Qt.NonModal)
+        dlg.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self._event_dlg = dlg          # 保持引用，避免被 Python GC 掉
+        dlg.load(ev)
+        dlg.show()                     # 子控件显示：不抢焦点、不挡输入、不置顶
+        if self._event_retry_timer.isActive():
+            self._event_retry_timer.stop()
+        if not self._event_auto_timer.isActive():
+            self._event_auto_timer.start()
+
+    def _auto_close_event(self):
+        # 60 秒没人理就默默收起：不算作主人「无视麟」，不说委屈台词
+        dlg = getattr(self, "_event_dlg", None)
+        if dlg is not None:
+            dlg.timeout()
+
+    def _on_event_overlay_finished(self, chosen):
+        # 覆盖层的统一出口：选 A/B（'a'/'b'）、超时（''）、外部 reject（''）
+        if self._event_retry_timer.isActive():
+            self._event_retry_timer.stop()
+        if self._event_auto_timer.isActive():
+            self._event_auto_timer.stop()
+        ev = getattr(self, "_pending_event", None)
+        if ev is None:
+            return
+        self._on_event_done(ev, chosen or None, getattr(self, "_event_dlg", None))
+
+    def _on_event_done(self, ev, chosen, dlg=None):
+        if self._pending_event is None:
+            return
         self._pending_event = None
-        if dlg.chosen:
-            key = dlg.chosen
+        self._event_dlg = None
+        self._event_defer = 0        # 事件结束后复位推迟计数
+        self._event_created_at = 0.0
+        if dlg is not None and getattr(dlg, "_timed_out", False):
+            return                    # 超时自动收起：静默，不打扰用户
+        if chosen:
+            key = chosen
             coin = ev.get("coin_a" if key == "a" else "coin_b", 0)
             aff = ev.get("aff_a" if key == "a" else "aff_b", 0)
-            self.add_coins(coin)
-            self.add_affinity(aff)
+            self.add_coins(int(coin or 0))
+            self.add_affinity(int(aff or 0))
             res = ev.get("res_a" if key == "a" else "res_b", "")
-            self.say("{}（金币{:+d}，好感{:+d}）".format(res, coin, aff), split=False)
-        else:
-            self.say("唔…幸歌居然不理麟了……", split=False)
+            self.say("{}（金币{:+d}，好感{:+d}）".format(res, int(coin or 0), int(aff or 0)), split=False)
+        # 用户直接关掉小窗时也不说话：安静收起，不打断手头的事
 
     # ---------- 11 闲聊陪伴（无操作计时） ----------
     def _idle_activity_check(self):
@@ -2160,7 +3025,8 @@ class PetWindow(QWidget):
             return
         if self.dlg_state != "idle":
             return
-        if time.time() - self.last_activity > self.idle_timeout:
+        # 用「本应用 + 全系统」的最近输入时间：主人在别的程序里忙时不算空闲
+        if self._recent_input_seconds() > self.idle_timeout:
             if time.time() - getattr(self, "_last_idle_msg", 0) > self.idle_timeout:
                 self._last_idle_msg = time.time()
                 self.busy = True
@@ -2168,6 +3034,49 @@ class PetWindow(QWidget):
                          "content": "你是桌宠麟，你的主人已经{}分钟没碰电脑了。请用一句（30字内）"
                                     "符合人设的关心或唠叨的话，语气可爱温柔，不要提AI。".format(self.idle_timeout // 60)}]
                 ask_llm(msgs, self.bus, kind="chat", temperature=1.0, max_tokens=50)
+
+    # ---------- 空闲/忙碌判定（本应用 + 全系统键鼠输入） ----------
+    def _system_idle_seconds(self):
+        """距最后一次「全系统」键鼠输入的秒数；拿不到时返回一个很大的数。
+
+        QApplication 的 eventFilter 只能看到本应用内的事件：主人在别的程序里
+        打字时这里什么都收不到，last_activity 会一直停在很久以前。必须用
+        Win32 GetLastInputInfo 才能看到全局的最后输入时刻。
+        非 Windows / 任何异常一律退化成「不忙」（旧行为），绝不让检测本身
+        把主流程搞崩。
+        """
+        if sys.platform != "win32":
+            return 1e9
+        try:
+            class _LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint),
+                            ("dwTime", ctypes.c_uint)]
+
+            info = _LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                return 1e9
+            now = ctypes.windll.kernel32.GetTickCount()
+            # GetTickCount 是 32 位、约 49.7 天回绕，用无符号差值算
+            delta = (int(now) - int(info.dwTime)) & 0xFFFFFFFF
+            if delta > 0x7FFFFFFF:     # 时钟被改/回绕异常，按「不忙」处理
+                return 1e9
+            return delta / 1000.0
+        except Exception:
+            return 1e9
+
+    def _recent_input_seconds(self):
+        """距主人最后一次键鼠操作的最小秒数（本应用与全系统取更近的一次）。"""
+        try:
+            app_idle = max(0.0, time.time() - float(
+                getattr(self, "last_activity", 0) or 0))
+        except Exception:
+            app_idle = 1e9
+        try:
+            sys_idle = float(self._system_idle_seconds())
+        except Exception:
+            sys_idle = 1e9
+        return min(app_idle, sys_idle)
 
     # ---------- 活动监听 ----------
     def eventFilter(self, obj, ev):
@@ -2217,7 +3126,8 @@ class PetWindow(QWidget):
                             getattr(self, "weather_temp", "") or "?"), split=False))
         m_tools.addAction("📡 网络检测").triggered.connect(
             lambda: self.say("当前网络{}，延迟约{}ms。".format("正常" if self.net_ok else "异常", self.net_ms), split=False))
-        m_tools.addAction("🎵 听歌陪伴（60秒）").triggered.connect(self.start_music)
+        m_tools.addAction("🎵 音乐播放器").triggered.connect(self.open_music_panel)
+        m_tools.addAction("🎧 麟在听什么").triggered.connect(self.say_now_playing)
         m_chat = m_tools.addMenu("💭 闲聊间隔")
         def _set_chat(s):
             self.idle_timeout = s
@@ -2253,6 +3163,7 @@ class PetWindow(QWidget):
         m_mood.addAction("📅 情绪历史").triggered.connect(self.open_mood_history)
         m_mood.addAction("📊 情绪统计").triggered.connect(self.open_mood_stats)
         m_mood.addAction("🌻 暖心寄语").triggered.connect(self.say_warm_word)
+        m_mood.addAction("💗 麟关心一下").triggered.connect(self.say_care)
         m_mood.addAction("🆘 危机支持").triggered.connect(self.open_crisis)
 
         # 传送门
@@ -2284,10 +3195,10 @@ class PetWindow(QWidget):
 
     # ---------- 菜单动作实现 ----------
     def open_history(self):
-        HistoryDialog(self).exec_()
+        self._exec_dialog(HistoryDialog(self))
 
     def open_memory(self):
-        MemoryDialog(self).exec_()
+        self._exec_dialog(MemoryDialog(self))
 
     def _say_memory_review(self):
         mem = load_memory()
@@ -2301,80 +3212,212 @@ class PetWindow(QWidget):
         else:
             self.say("麟还在慢慢了解幸歌呢～多和麟聊聊天，麟会记住的！", split=False)
 
+    def _fit_dialog_to_screen(self, dlg):
+        """把对话框夹进当前屏幕可视区，避免弹到屏幕外/装饰外，看着像「点了没反应」"""
+        try:
+            scr = self.screen() or QApplication.primaryScreen()
+            avail = scr.availableGeometry()
+            w = max(dlg.sizeHint().width(), dlg.minimumWidth(), 320)
+            h = max(dlg.sizeHint().height(), dlg.minimumHeight(), 240)
+            w = min(w, avail.width() - 24)
+            h = min(h, avail.height() - 24)
+            x = self.x() + (self.width() - w) // 2
+            y = self.y() + (self.height() - h) // 2
+            x = min(max(avail.x() + 12, x), avail.x() + avail.width() - w - 12)
+            y = min(max(avail.y() + 12, y), avail.y() + avail.height() - h - 12)
+            dlg.setGeometry(x, y, w, h)
+        except Exception as e:
+            print("[fit_dialog]", e)
+
+    # ---------- 窗口置顶控制 ----------
+    @staticmethod
+    def _set_hwnd_topmost(hwnd, on):
+        """用 Win32 SetWindowPos 改 WS_EX_TOPMOST：不隐藏窗口、不闪、不抢焦点。
+
+        非 Windows 或调用失败返回 False，调用方退回 Qt 的 setWindowFlag。"""
+        try:
+            if os.name != "nt":
+                return False
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                         ctypes.c_int, ctypes.c_int,
+                                         ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+            u32.SetWindowPos.restype = wintypes.BOOL
+            after = wintypes.HWND(-1 if on else -2)   # HWND_TOPMOST / HWND_NOTOPMOST
+            flags = 0x0001 | 0x0002 | 0x0010          # NOSIZE|NOMOVE|NOACTIVATE
+            return bool(u32.SetWindowPos(wintypes.HWND(int(hwnd)), after,
+                                         0, 0, 0, 0, flags))
+        except Exception:
+            return False
+
+    def _sync_pet_topmost(self):
+        """按「用户是否要置顶 + 现在有没有面板开着」决定桌宠的置顶状态。"""
+        want = bool(getattr(self, "_always_on_top", True)) and getattr(self, "_dialog_depth", 0) == 0
+        if getattr(self, "_topmost_now", None) == want:
+            return
+        self._topmost_now = want
+        try:
+            hwnd = int(self.winId())
+        except Exception:
+            return
+        if self._set_hwnd_topmost(hwnd, want):
+            return
+        try:  # 兜底：非 Windows / Win32 失败时用 Qt 接口（会闪一下，但不影响功能）
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, want)
+            self.show()
+        except Exception:
+            pass
+
+    def _pin_pet(self, on):
+        """面板打开/关闭时临时收放桌宠的置顶：打开面板期间让浏览器等窗口能盖上来。"""
+        if on:
+            self._dialog_depth = max(0, getattr(self, "_dialog_depth", 0) - 1)
+        else:
+            self._dialog_depth = getattr(self, "_dialog_depth", 0) + 1
+        self._sync_pet_topmost()
+
+    def set_always_on_top(self, on):
+        """设置面板勾选「保持置顶」时调用，立即生效并写回 settings.json。"""
+        self._always_on_top = bool(on)
+        self.settings["always_on_top"] = self._always_on_top
+        try:
+            save_json("settings.json", self.settings)   # 面板里的 save_json 在调用本函数之前，这里补存
+        except Exception as e:
+            print("[set_always_on_top]", e)
+        self._topmost_now = None
+        self._sync_pet_topmost()
+
+    def _exec_dialog(self, dlg):
+        """以「不置顶」的方式打开模态面板。
+
+        旧版所有面板都是无边框置顶桌宠的子窗口，Windows 会把它们一起放进置顶层，
+        于是用户点浏览器也抬不到前面（一直被面板挡着）。现在：面板不置顶，
+        打开期间桌宠也临时让位，关掉后恢复置顶。
+        """
+        self._pin_pet(False)
+        try:
+            dlg.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            # 子窗口的置顶样式是创建时继承来的，show 之后再清一次最稳
+            QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+            return dlg.exec_()
+        finally:
+            self._pin_pet(True)
+
     def open_help(self):
-        HelpDialog(self).exec_()
+        """帮助改成非模态小窗：旧版 exec_ 的模态框会挡住桌宠（又常被置顶的桌宠遮住），
+        用户看到的就是「点了帮助没反应、桌宠也不动了」= 卡死。现在不阻塞、只开一个、夹在屏内。"""
+        try:
+            dlg = getattr(self, "_help_dlg", None)
+            if dlg is not None and dlg.isVisible():
+                dlg.raise_()
+                return
+            dlg = HelpDialog(self)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.setAttribute(Qt.WA_DeleteOnClose, True)
+            # 不抢键盘焦点：主人在打字时点帮助，输入框的光标不该被抢走
+            dlg.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            # 不置顶：说明书开着时，用户点浏览器应该能把浏览器抬到前面
+            dlg.setWindowFlag(Qt.WindowStaysOnTopHint, False)
+            self._help_dlg = dlg
+            self._help_pinned = True
+
+            def _help_closed(_r=0):
+                """help 关掉后恢复桌宠置顶；加个标志位，防止 finished/destroyed 重复扣计数。"""
+                self._help_dlg = None
+                if getattr(self, "_help_pinned", False):
+                    self._help_pinned = False
+                    self._pin_pet(True)
+
+            dlg.finished.connect(_help_closed)
+            dlg.destroyed.connect(lambda *_: _help_closed())
+            self._fit_dialog_to_screen(dlg)
+            self._pin_pet(False)
+            dlg.show()
+            QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
+        except Exception as e:
+            self._help_dlg = None
+            print("[open_help]", e)
+            self.say("唔…说明书打不开（{}）".format(e), split=False)
 
     def open_persona(self):
         d = PersonaDialog(self.current_prompt, self)
-        if d.exec_() == QDialog.Accepted and d.result_text():
+        if self._exec_dialog(d) == QDialog.Accepted and d.result_text():
             self.current_prompt = d.result_text()
             self.history = []
+            if self.ctx is not None:
+                self.ctx.reset()          # 人设变了，旧摘要不再适用
+            self._summary_pending = False
             append_log("system", "[人设更新] " + d.result_text()[:30] + "…")
             self.say("人设更新成功啦～麟会记住新的自己！", split=False)
 
     def open_profile(self):
         d = ProfileDialog(self.profile, self)
-        if d.exec_() == QDialog.Accepted:
+        if self._exec_dialog(d) == QDialog.Accepted:
             self.profile = {"nickname": d.e_nick.text().strip(), "birthday": d.e_birth.text().strip(),
                             "how_to_call": d.e_call.text().strip(), "relation": d.e_rel.text().strip()}
             save_json("profile.json", self.profile)
             self.history = []
+            if self.ctx is not None:
+                self.ctx.reset()          # 档案变了（称呼/生日），旧摘要不再适用
+            self._summary_pending = False
             self.say("档案更新啦～幸歌，我们的关系是{}，对吧？".format(
                 self.profile.get("relation", "最好的伙伴")), split=False)
 
     def open_focus(self):
         d = FocusDialog(self)
-        if d.exec_() == QDialog.Accepted and d.minutes() > 0:
+        if self._exec_dialog(d) == QDialog.Accepted and d.minutes() > 0:
             self.start_focus(d.minutes())
 
     def open_backpack(self):
-        BackpackDialog(self).exec_()
+        self._exec_dialog(BackpackDialog(self))
 
     def open_shop(self):
-        ShopDialog(self).exec_()
+        self._exec_dialog(ShopDialog(self))
 
     def open_schedule(self):
-        ScheduleDialog(self).exec_()
+        self._exec_dialog(ScheduleDialog(self))
 
     def open_note(self):
-        NoteDialog(self).exec_()
+        self._exec_dialog(NoteDialog(self))
 
     def open_organize(self):
-        OrganizeDialog(self).exec_()
+        self._exec_dialog(OrganizeDialog(self))
 
     def open_rps(self):
-        RPSDialog(self).exec_()
+        self._exec_dialog(RPSDialog(self))
 
     def open_dice(self):
-        DiceDialog(self).exec_()
+        self._exec_dialog(DiceDialog(self))
 
     def open_mood_record(self):
-        MoodRecordDialog(self).exec_()
+        self._exec_dialog(MoodRecordDialog(self))
 
     def open_assessment(self):
-        AssessmentDialog(self).exec_()
+        self._exec_dialog(AssessmentDialog(self))
 
     def open_assessment_history(self):
-        AssessmentHistoryDialog(self).exec_()
+        self._exec_dialog(AssessmentHistoryDialog(self))
 
     def open_mood_history(self):
-        MoodHistoryDialog(self).exec_()
+        self._exec_dialog(MoodHistoryDialog(self))
 
     def open_mood_stats(self):
-        MoodStatsDialog(self).exec_()
+        self._exec_dialog(MoodStatsDialog(self))
 
     def open_crisis(self):
-        CrisisSupportDialog(self).exec_()
+        self._exec_dialog(CrisisSupportDialog(self))
 
     def say_warm_word(self):
         """心理陪伴：随机一条暖心寄语"""
         self.say("（🌻 暖心寄语）" + pick_warm_word(), split=False)
 
     def open_settings(self):
-        SettingsDialog(self).exec_()
+        self._exec_dialog(SettingsDialog(self))
 
     def open_api_manager(self):
-        ApiManagerDialog(self).exec_()
+        self._exec_dialog(ApiManagerDialog(self))
         self._update_mode_label()
 
     def toggle_aff_bar(self):
@@ -2453,6 +3496,7 @@ class PetWindow(QWidget):
         self._show(end_file)
 
     def closeEvent(self, event):
+        self._stop_music_audio()      # 退出时一定要把八音盒停掉
         self.economy["affinity"] = self.affinity
         self.economy["coins"] = self.coins
         save_json("economy.json", self.economy)
@@ -2461,9 +3505,56 @@ class PetWindow(QWidget):
 
 # ==================== 六、入口 ====================
 
+def install_tray(win):
+    """给桌宠装常驻托盘图标（main 启动时调用；独立成函数便于探针验证）。
+
+    左键/双击：把麟叫到最前（隐藏状态下先显示）；
+    右键菜单：显示/隐藏麟、音乐播放器（召回最小化面板）、停止音乐、退出。
+    """
+    icon_path = resource_path("favicon.ico")
+    tray = QSystemTrayIcon(QIcon(icon_path) if os.path.exists(icon_path)
+                           else QIcon(resource_path(IMG_NING)))
+    tray.setToolTip("麟桌宠（点一下找到麟）")
+    tray_menu = QMenu()
+    _act_toggle = tray_menu.addAction("🐾 显示 / 隐藏 麟")
+    tray_menu.addSeparator()
+    _act_music = tray_menu.addAction("🎵 音乐播放器")
+    _act_stop = tray_menu.addAction("⏹ 停止音乐")
+    tray_menu.addSeparator()
+    _act_quit = tray_menu.addAction("❌ 退出桌宠")
+    tray.setContextMenu(tray_menu)
+
+    def _tray_toggle():
+        if win.isVisible():
+            win.hide()
+        else:
+            win.show()
+            win.raise_()
+
+    def _tray_activated(reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if not win.isVisible():
+                win.show()
+            win.raise_()
+
+    _act_toggle.triggered.connect(_tray_toggle)
+    _act_music.triggered.connect(win.open_music_panel)
+    _act_stop.triggered.connect(lambda: win.stop_music())
+    _act_quit.triggered.connect(QApplication.quit)
+    tray.activated.connect(_tray_activated)
+    tray.show()
+    win._tray = tray                    # 持引用防 GC
+    return tray
+
+
 def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    # 去掉所有对话框标题栏右上角的「?」（WindowContextHelpButtonHint / 上下文帮助按钮）：
+    # 点它会进入 What's This 模式——整个应用等着下一次点击、还会冒出跟随光标的小提示气泡，
+    # 用户看到的就是「点了 ? 就卡死」和「偶尔冒个小窗又瞬间消失、打断打字」。
+    # 麟没有给任何控件写 What's this 文案，这个按钮纯属误触，直接全局关掉。
+    QApplication.setAttribute(Qt.AA_DisableWindowContextHelpButton, True)
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
@@ -2474,20 +3565,44 @@ def main():
 
     ensure_data_files()
 
-    cfg = load_api_config()
-    has_key = any(
-        (a.get("key") or "").strip()
-        or ("localhost" in (a.get("base_url") or "").lower()
-            or "127.0.0.1" in (a.get("base_url") or "").lower())
-        for a in cfg.get("apis", []) if a.get("enabled"))
-    if not has_key:
-        ask_api_key_once()
-
+    # 不再在启动时弹「输入 API Key」的输入框：那个模态输入框会抢焦点，
+    # 用户恰好正在别的窗口打字时，按键会被它吃掉、甚至把它瞬间关掉，
+    # 看起来就像「冒出一个弹窗又马上消失」。没 Key 时走离线保底模式，
+    # 需要联网时在右键菜单「🔌 API 管理」里配置即可。
+    # 先装兜底（此时还没有窗口状态可复位），保证窗口构造期间出异常也不会闪退
+    install_crash_guard(os.path.join(data_dir(), "crash.log"))
     win = PetWindow()
+
+    def _recover_from_slot_error(exc):
+        """槽函数出错后复位界面状态，避免永久卡在「思考中 / 忙碌」"""
+        try:
+            win.busy = False
+            win._memory_busy = False
+            win.event_busy = False
+            win._sleep_pending = False
+            if win.pose == "thinking":
+                win.pose = "idle"
+                win._show(win._idle_file())
+        except Exception:
+            pass
+
+    # 全局异常兜底：PyQt5 的槽函数只要漏出一个未捕获异常，默认会 abort 整个进程，
+    # 这就是「桌宠偶尔自己退出」的主因之一。装好之后异常只写 crash.log，进程继续活着，
+    # 并把卡住的「思考中/忙碌」状态复位（第二次 install 只是补上恢复回调）。
+    install_crash_guard(os.path.join(data_dir(), "crash.log"),
+                        on_error=_recover_from_slot_error)
     win.show()
 
     screen = app.primaryScreen().availableGeometry()
     win.move(screen.right() - win.width() - 60,
              screen.bottom() - win.height() - 60)
+
+    # 托盘图标：桌宠是无边框小窗（按惯例不占任务栏，占位反而容易被误点弄丢麟），
+    # 托盘是常驻的「定位入口」——左键/双击把麟叫到最前，右键菜单能开关桌宠、
+    # 打开音乐播放器（含最小化召回）、停止音乐、退出。
+    try:
+        install_tray(win)
+    except Exception as e:
+        print("[tray]", e)
 
     sys.exit(app.exec_())

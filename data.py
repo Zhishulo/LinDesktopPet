@@ -4,6 +4,8 @@
 import os
 import sys
 import json
+import time   # append_log 用 time.strftime 写时间戳（缺失会导致聊天时崩溃）
+from pathlib import Path
 
 from config import DEFAULT_ITEMS, DEFAULT_SETTINGS, DEFAULT_README, MEMORY_FILE, MEMORY_LOG_DIR
 
@@ -13,6 +15,18 @@ def data_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return BASE_DIR
+
+
+def safe_data_path(name):
+    """拼接数据文件路径并做防穿越校验：规范化后必须仍落在数据目录内。
+
+    所有调用点的 name 都是程序内常量，这是纵深防御而非修复已知漏洞。
+    """
+    base = os.path.realpath(data_dir())
+    p = os.path.realpath(os.path.join(base, name))
+    if p != base and not p.startswith(base + os.sep):
+        raise ValueError("数据文件路径越界: %r" % (name,))
+    return p
 
 
 def resource_path(name):
@@ -27,16 +41,15 @@ def resource_path(name):
 
 def load_json(name, default):
     try:
-        with open(os.path.join(data_dir(), name), "r", encoding="utf-8") as f:
-            return json.load(f)
+        return json.loads(Path(safe_data_path(name)).read_text(encoding="utf-8"))
     except Exception:
         return default
 
 
 def save_json(name, obj):
     try:
-        with open(os.path.join(data_dir(), name), "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
+        Path(safe_data_path(name)).write_text(
+            json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as e:
         print("[保存失败]", name, e)
 
@@ -52,8 +65,7 @@ def save_memory(mem):
 def load_api_key():
     """从本地文件读取 API Key（打包后放在 exe 旁边）"""
     try:
-        with open(os.path.join(data_dir(), "api_key.txt"), "r", encoding="utf-8") as f:
-            return f.read().strip()
+        return Path(safe_data_path("api_key.txt")).read_text(encoding="utf-8").strip()
     except Exception:
         return ""
 
@@ -61,8 +73,7 @@ def load_api_key():
 def save_api_key(key):
     """把 API Key 存到本地文件"""
     try:
-        with open(os.path.join(data_dir(), "api_key.txt"), "w", encoding="utf-8") as f:
-            f.write(key.strip())
+        Path(safe_data_path("api_key.txt")).write_text(key.strip(), encoding="utf-8")
     except Exception as e:
         print("[保存 Key 失败]", e)
 
@@ -114,17 +125,15 @@ def ensure_data_files():
                                      "DeepSeek": "https://chat.deepseek.com"})
     if not os.path.exists(os.path.join(data_dir(), "chat_log.json")):
         save_json("chat_log.json", [])
-    notes = os.path.join(data_dir(), "notes.txt")
+    notes = safe_data_path("notes.txt")
     if not os.path.exists(notes):
-        with open(notes, "w", encoding="utf-8") as f:
-            f.write("# 麟的随手记\n")
-    if not os.path.exists(os.path.join(data_dir(), "settings.json")):
+        Path(notes).write_text("# 麟的随手记\n", encoding="utf-8")
+    if not os.path.exists(safe_data_path("settings.json")):
         save_json("settings.json", DEFAULT_SETTINGS)
-    readme = os.path.join(data_dir(), "readme.md")
+    readme = safe_data_path("readme.md")
     if not os.path.exists(readme):
-        with open(readme, "w", encoding="utf-8") as f:
-            f.write(DEFAULT_README)
-    if not os.path.exists(os.path.join(data_dir(), MEMORY_FILE)):
+        Path(readme).write_text(DEFAULT_README, encoding="utf-8")
+    if not os.path.exists(safe_data_path(MEMORY_FILE)):
         save_memory(load_memory())
     os.makedirs(os.path.join(data_dir(), MEMORY_LOG_DIR), exist_ok=True)
     if not os.path.exists(os.path.join(data_dir(), "mood.json")):

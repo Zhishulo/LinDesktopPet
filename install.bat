@@ -17,7 +17,7 @@ if errorlevel 1 (
 
 echo 开始安装依赖库，请耐心等待（约1-3分钟）……
 python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
-python -m pip install PyQt5 PyQt5-Qt5 requests psutil pyinstaller -i https://pypi.tuna.tsinghua.edu.cn/simple
+python -m pip install PyQt5 PyQt5-Qt5 requests psutil pyinstaller winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Media winrt-Windows.Media.Control winrt-Windows.Media.Core winrt-Windows.Media.Playback winrt-Windows.Storage -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 echo.
 echo ==============================================

@@ -3,6 +3,10 @@
 *.spec
 build/
 dist/
+LinDesktopPet.zip
+
+# 工具内部状态（含本机路径与会话信息，绝不开源）
+.mimosa/
 
 # Python 缓存
 __pycache__/
@@ -23,3 +27,7 @@ bookmarks.json
 launcher.json
 schedule.json
 memory_log/
+
+# 曲库（72 首用户 mp3，约 251MB，随 exe 打包/随文件夹分发，不进 git）
+/music/
+LinDesktopPet.zip

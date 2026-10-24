@@ -5,8 +5,10 @@ import os
 import sys
 import time
 import random
+import shutil
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QPixmap, QPainter, QLinearGradient, QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QLabel, QLineEdit, QPushButton, QHBoxLayout,
     QVBoxLayout, QFrame, QPlainTextEdit, QSpinBox, QSlider, QFormLayout,
@@ -15,13 +17,14 @@ from PyQt5.QtWidgets import (
     QRadioButton, QStackedWidget, QScrollArea, QProgressBar)
 
 from config import SHOP_ITEMS, MEMORY_LOG_DIR
-from data import data_dir, load_json, save_json, load_log, save_log
+from data import data_dir, resource_path, load_json, save_json, load_log, save_log
 from api_client import ask_llm, load_api_config, save_api_config, test_api
 from mood import (MOOD_TYPES, MOOD_TAGS, INTENSITY_NAMES, CRISIS_LINES,
                   load_moods, add_record, delete_record, analyze,
                   mood_name, mood_emoji)
 from assessment import (SCALES, SCALES_BY_KEY, load_assessments,
                         delete_assessment, add_assessment, scales_by_category)
+from music_folder import fmt_ms, external_dir, AUDIO_EXTS
 class HistoryDialog(QDialog):
     """1. 历史记录面板：带时间戳 + 每行删除按钮（删除=物理失忆）"""
     def __init__(self, parent=None):
@@ -81,22 +84,42 @@ class HelpDialog(QDialog):
         tb = QTextBrowser()
         tb.setOpenExternalLinks(True)
         path = os.path.join(data_dir(), "readme.md")
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                tb.setMarkdown(f.read())
+        # 说明书可能被用户改坏/超长：任何异常都退化成纯文本，绝不让帮助窗口卡住或打不开
+        text = ""
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    text = f.read(200000)
+        except Exception:
+            text = ""
+        if text.strip():
+            try:
+                tb.setMarkdown(text)
+            except Exception:
+                tb.setPlainText(text)
         else:
-            tb.setPlainText("readme.md 不存在，首次启动会自动生成。")
+            tb.setPlainText("readme.md 还没生成或读不出来，先把麟运行一会儿，它会自动写一份说明书～")
         lay.addWidget(tb)
         h = QHBoxLayout()
         edit_btn = QPushButton("用系统记事本打开 readme.md")
         if sys.platform == "win32":
-            edit_btn.clicked.connect(lambda: os.startfile(path))
+            edit_btn.clicked.connect(lambda: self._open_readme(path))
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         h.addWidget(edit_btn)
         h.addStretch(1)
         h.addWidget(close_btn)
         lay.addLayout(h)
+
+    def _open_readme(self, path):
+        """用记事本打开说明书；文件缺失或启动失败只提示，不抛异常（抛了会闪退/像卡死）"""
+        if not os.path.exists(path):
+            QMessageBox.information(self, "提示", "readme.md 还没生成，先把麟运行一会儿吧～")
+            return
+        try:
+            os.startfile(path)
+        except Exception as e:
+            QMessageBox.information(self, "打不开", "没能打开记事本：{}".format(e))
 
 
 class MemoryDialog(QDialog):
@@ -1400,6 +1423,12 @@ class SettingsDialog(QDialog):
         form.addRow("", self.wt_slider)
         lay.addLayout(form)
 
+        # 置顶开关：默认置顶（桌宠不被别的窗口压住），关掉就按普通窗口排；
+        # 无论开不开，打开面板时桌宠都会临时让位，所以不会挡住浏览器。
+        self.top_check = QCheckBox("桌宠窗口保持置顶（不被其它窗口遮住）")
+        self.top_check.setChecked(bool(getattr(parent, "_always_on_top", True)))
+        lay.addWidget(self.top_check)
+
         h = QHBoxLayout()
         reset_btn = QPushButton("恢复默认")
         reset_btn.setStyleSheet("QPushButton{background:#e0c9a8;color:#3d2b1f;border:none;border-radius:8px;padding:6px 12px;}")
@@ -1427,6 +1456,7 @@ class SettingsDialog(QDialog):
         self.evt_min_spin.setValue(30)
         self.evt_max_spin.setValue(120)
         self.wt_slider.setValue(60)
+        self.top_check.setChecked(True)
 
     def save_settings(self):
         win = self.parent
@@ -1443,5 +1473,452 @@ class SettingsDialog(QDialog):
         win.event_max = evt_max
         win.event_freq = random.randint(evt_min, evt_max)
         win.event_weight = self.wt_slider.value()
+        if hasattr(win, "set_always_on_top"):
+            win.set_always_on_top(self.top_check.isChecked())
         win.say("设置保存好啦～", split=False)
         QMessageBox.information(self, "设置", "已保存！\n闲聊与随机事件参数已立即生效；\n宠物尺寸将在下次启动时生效。")
+
+
+class MusicPlayerDialog(QDialog):
+    """音乐播放器面板：封面/进度/控制按钮/音量 + 可搜索的播放队列。
+
+    播放器本体（MusicFolderPlayer）挂在 PetWindow 上。窗口行为（2026-10-24 定稿）：
+    标题栏右上角是系统原生的 — □ × 三键：— 最小化到任务栏（音乐继续，任务栏或
+    菜单「🎵 音乐播放器」召回）；□ 最大化；× 关闭 = 停止播放。「⏹ 停止」/入睡/
+    进游戏/退出也停。面板是非模态窗口，开着也不挡桌宠本体。内置曲目来自 exe，
+    本地曲目来自 exe 旁 music/ 文件夹，两种都会列在队列里（带来源标签）。
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        win = parent
+        self.player = getattr(win, "music_player", lambda: None)()
+        self._seeking = False
+        self.setWindowTitle("🎵 麟的音乐播放器")
+        # 标题栏右上角显示原生 — □ × 三键（用户指定样式）：— 最小化（音乐继续）、
+        # □ 最大化、× 关闭即停歌；Qt.Window 让面板有自己的任务栏项，最小化可从任务栏召回
+        self.setWindowFlags(Qt.Window
+                            | Qt.WindowMinimizeButtonHint
+                            | Qt.WindowMaximizeButtonHint
+                            | Qt.WindowCloseButtonHint)
+        self.setMinimumSize(560, 560)
+        # 背景图（bg.jpg 水彩雨巷，用户指定）：paintEvent 里铺满 + 暖色半透明罩；
+        # 缺图时退回纯色，绝不因素材缺失打不开面板
+        self._bg = QPixmap()
+        try:
+            _bg_path = resource_path("bg.jpg")
+            if os.path.exists(_bg_path):
+                self._bg.load(_bg_path)
+        except Exception:
+            self._bg = QPixmap()
+        self._bg_scaled = None        # 按当前窗口尺寸缓存，resize 时置空
+        self.setStyleSheet("QDialog{background:transparent;}"
+                           "QListWidget{background:rgba(255,250,240,215);color:#3d2b1f;}"
+                           "QLineEdit{background:rgba(255,250,240,215);color:#3d2b1f;"
+                           "border:1px solid rgba(216,196,160,190);border-radius:4px;padding:2px 6px;}"
+                           "QPushButton{background:rgba(240,226,200,225);color:#3d2b1f;"
+                           "border:1px solid rgba(216,196,160,210);border-radius:4px;padding:4px 10px;}"
+                           "QPushButton:hover{background:rgba(232,213,176,240);}"
+                           "QCheckBox{color:#3d2b1f;}")
+
+        lay = QVBoxLayout(self)
+
+        # ---- 顶部：封面 + 曲名/来源 ----
+        top = QHBoxLayout()
+        self.cover_lab = QLabel()
+        self.cover_lab.setFixedSize(120, 120)
+        self.cover_lab.setAlignment(Qt.AlignCenter)
+        self.cover_lab.setStyleSheet("background:#f0e2c8;border:1px solid #d8c4a0;border-radius:6px;")
+        self.cover_lab.setScaledContents(True)
+        top.addWidget(self.cover_lab)
+        info = QVBoxLayout()
+        self.title_lab = QLabel("还没有开始播放")
+        self.title_lab.setWordWrap(True)
+        self.title_lab.setStyleSheet("font-size:16px;font-weight:bold;color:#5a3d2b;")
+        self.sub_lab = QLabel("")
+        self.sub_lab.setStyleSheet("color:#8a6f4d;font-size:12px;")
+        info.addWidget(self.title_lab)
+        info.addWidget(self.sub_lab)
+        info.addStretch(1)
+        top.addLayout(info, 1)
+        lay.addLayout(top)
+
+        # ---- 进度条 ----
+        prog = QHBoxLayout()
+        self.t_cur = QLabel("00:00")
+        self.t_total = QLabel("00:00")
+        self.progress = QSlider(Qt.Horizontal)
+        self.progress.setRange(0, 0)
+        prog.addWidget(self.t_cur)
+        prog.addWidget(self.progress, 1)
+        prog.addWidget(self.t_total)
+        lay.addLayout(prog)
+
+        # ---- 控制按钮行 ----
+        ctrl = QHBoxLayout()
+        self.mode_btn = QPushButton("🔀 随机播放")
+        self.prev_btn = QPushButton("⏮")
+        self.play_btn = QPushButton("▶ 播放")
+        self.next_btn = QPushButton("⏭")
+        self.stop_btn = QPushButton("⏹ 停止")
+        for b in (self.mode_btn, self.prev_btn, self.play_btn, self.next_btn, self.stop_btn):
+            b.setFocusPolicy(Qt.NoFocus)
+        ctrl.addWidget(self.mode_btn)
+        ctrl.addStretch(1)
+        ctrl.addWidget(self.prev_btn)
+        ctrl.addWidget(self.play_btn)
+        ctrl.addWidget(self.next_btn)
+        ctrl.addStretch(1)
+        ctrl.addWidget(self.stop_btn)
+        lay.addLayout(ctrl)
+
+        # ---- 音量行 ----
+        vol = QHBoxLayout()
+        self.mute_chk = QCheckBox("静音")
+        vol_lab = QLabel("🔊")
+        self.vol_slider = QSlider(Qt.Horizontal)
+        self.vol_slider.setRange(0, 100)
+        vol.addWidget(self.mute_chk)
+        vol.addWidget(vol_lab)
+        vol.addWidget(self.vol_slider, 1)
+        lay.addLayout(vol)
+
+        # ---- 队列 ----
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("🔍 搜索队列…（输入关键字过滤）")
+        self.search.setFocusPolicy(Qt.ClickFocus)
+        lay.addWidget(self.search)
+        self.queue = QListWidget()
+        self.queue.itemDoubleClicked.connect(self._on_queue_dclick)
+        lay.addWidget(self.queue, 1)
+
+        # ---- 底部按钮 ----
+        bottom = QHBoxLayout()
+        imp_btn = QPushButton("📥 导入音乐")
+        open_btn = QPushButton("📂 打开音乐文件夹")
+        rm_btn = QPushButton("➖ 移除选中")
+        restore_btn = QPushButton("♻️ 恢复全部")
+        for b in (imp_btn, open_btn, rm_btn, restore_btn):
+            b.setFocusPolicy(Qt.NoFocus)
+        bottom.addWidget(imp_btn)
+        bottom.addWidget(open_btn)
+        bottom.addWidget(rm_btn)
+        bottom.addWidget(restore_btn)
+        bottom.addStretch(1)
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        bottom.addWidget(close_btn)
+        lay.addLayout(bottom)
+
+        tip = QLabel("内置歌曲在 exe 里随身携带；导入的歌复制到 exe 旁 music 文件夹，升级也不丢。"
+                     "标题栏「—」最小化（音乐继续，任务栏召回）；「×」或「关闭」停止播放。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#8a6f4d;font-size:11px;")
+        lay.addWidget(tip)
+
+        # ---- 信号 ----
+        self.mode_btn.clicked.connect(self._cycle_mode)
+        self.prev_btn.clicked.connect(lambda: self._guard(self.player.previous))
+        self.play_btn.clicked.connect(lambda: self._guard(self.player.toggle))
+        self.next_btn.clicked.connect(lambda: self._guard(self.player.next))
+        self.stop_btn.clicked.connect(self._stop_music)
+        self.progress.sliderPressed.connect(self._seek_start)
+        self.progress.sliderMoved.connect(self._seek_move)
+        self.progress.sliderReleased.connect(self._seek_apply)
+        self.vol_slider.valueChanged.connect(self._volume_changed)
+        self.vol_slider.sliderReleased.connect(self._volume_saved)
+        self.mute_chk.toggled.connect(self._mute_changed)
+        self.search.textChanged.connect(self._apply_filter)
+        imp_btn.clicked.connect(self._import_music)
+        open_btn.clicked.connect(self._open_folder)
+        rm_btn.clicked.connect(self._remove_selected)
+        restore_btn.clicked.connect(self._restore_all)
+
+        self._connect_player()
+        self._load_cover()
+        self._refresh_all()
+
+    # ---- 播放器信号接入 --------------------------------------------------
+    def _connect_player(self):
+        if self.player is None:
+            return
+        self.player.trackChanged.connect(self._on_track)
+        self.player.stateChanged.connect(self._on_state)
+        self.player.modeChanged.connect(self._on_mode)
+        self.player.positionChanged.connect(self._on_position)
+        self.player.queueChanged.connect(self._refresh_all)
+
+    def _disconnect_player(self):
+        """关闭面板时摘掉所有信号连接（播放器还要长期用，别让旧面板吃信号）。"""
+        if self.player is None:
+            return
+        try:
+            self.player.trackChanged.disconnect(self._on_track)
+            self.player.stateChanged.disconnect(self._on_state)
+            self.player.modeChanged.disconnect(self._on_mode)
+            self.player.positionChanged.disconnect(self._on_position)
+            self.player.queueChanged.disconnect(self._refresh_all)
+        except Exception:
+            pass
+
+    def changeEvent(self, event):
+        """最小化到任务栏时让麟说一句（音乐继续放）。"""
+        super().changeEvent(event)
+        try:
+            if self.windowState() & Qt.WindowMinimized:
+                win = self.parent()
+                if hasattr(win, "say"):
+                    win.say("面板最小化啦，音乐继续放♪任务栏或菜单里都能叫回来", split=False)
+        except Exception:
+            pass
+
+    def paintEvent(self, event):
+        """画背景：bg.jpg 水彩雨巷按比例铺满窗口，再叠一层暖奶油半透明罩，
+        保证深棕文字在各处都可读；bg.jpg 缺失时退回纯色。"""
+        p = QPainter(self)
+        try:
+            rect = self.rect()
+            if self._bg is not None and not self._bg.isNull():
+                w, h = rect.width(), rect.height()
+                if (self._bg_scaled is None
+                        or self._bg_scaled.width() != w
+                        or self._bg_scaled.height() != h):
+                    self._bg_scaled = self._bg.scaled(
+                        w, h, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                p.drawPixmap((w - self._bg_scaled.width()) // 2,
+                             (h - self._bg_scaled.height()) // 2,
+                             self._bg_scaled)
+                p.fillRect(rect, QColor(253, 246, 236, 150))
+            else:
+                p.fillRect(rect, QColor("#fdf6ec"))
+        finally:
+            p.end()
+
+    def resizeEvent(self, event):
+        self._bg_scaled = None           # 尺寸变了，背景缩放缓存作废（最大化/还原都会进来）
+        super().resizeEvent(event)
+
+    def done(self, r):
+        """accept/reject/标题栏 × 都汇聚到这里：关面板 = 停止播放（最小化才继续放）。"""
+        self._disconnect_player()
+        try:
+            win = self.parent()
+            if hasattr(win, "stop_music"):
+                win.stop_music()
+        except Exception:
+            pass
+        super().done(r)
+
+    def _guard(self, fn):
+        try:
+            fn()
+        except Exception:
+            pass
+
+    # ---- 状态刷新 --------------------------------------------------------
+    def _refresh_all(self):
+        self._fill_queue()
+        if self.player is None:
+            self.title_lab.setText("这台电脑放不了歌（缺 QtMultimedia）")
+            self.sub_lab.setText("麟会改用八音盒陪你～")
+            return
+        self._on_track(*self._current_tuple())
+        self._on_state(self.player.is_playing())
+        self._on_mode(self.player.mode_key())
+        self.vol_slider.blockSignals(True)
+        self.vol_slider.setValue(self.player.volume())
+        self.vol_slider.blockSignals(False)
+        self.mute_chk.setChecked(self.player.is_muted())
+
+    def _current_tuple(self):
+        try:
+            cur = self.player.current_track()
+            if cur:
+                return cur["index"], cur["title"], cur["source"]
+        except Exception:
+            pass
+        return -1, "", ""
+
+    def _on_track(self, idx, title, source):
+        if title:
+            self.title_lab.setText("《{}》".format(title))
+            self.sub_lab.setText("第 {} / {} 首 · 来源：{}".format(
+                idx + 1, len(self.player.tracks()), source))
+        else:
+            self.title_lab.setText("还没有开始播放")
+            self.sub_lab.setText("")
+        self._highlight_current()
+
+    def _on_state(self, playing):
+        self.play_btn.setText("⏸ 暂停" if playing else "▶ 播放")
+
+    def _on_mode(self, key):
+        self.mode_btn.setText("🔀 " + self.player.__class__.mode_name(key))
+
+    def _on_position(self, pos, dur):
+        if dur > 0:
+            self.progress.setRange(0, dur)
+        self.t_total.setText(fmt_ms(dur))
+        if not self._seeking:
+            self.progress.blockSignals(True)
+            self.progress.setValue(pos)
+            self.progress.blockSignals(False)
+        self.t_cur.setText(fmt_ms(pos))
+
+    def _highlight_current(self):
+        cur_idx = self._current_tuple()[0]
+        for i in range(self.queue.count()):
+            it = self.queue.item(i)
+            if i == cur_idx:
+                it.setText("♪ " + it.data(Qt.UserRole))
+                font = it.font()
+                font.setBold(True)
+                it.setFont(font)
+            else:
+                it.setText(it.data(Qt.UserRole))
+                font = it.font()
+                font.setBold(False)
+                it.setFont(font)
+
+    def _fill_queue(self):
+        self.queue.clear()
+        if self.player is None:
+            return
+        for i, (path, title, source) in enumerate(self.player.tracks()):
+            it = QListWidgetItem("[{}] {}".format(source, title))
+            it.setData(Qt.UserRole, "[{}] {}".format(source, title))
+            it.setData(Qt.UserRole + 1, i)
+            self.queue.addItem(it)
+        self._highlight_current()
+        self._apply_filter(self.search.text())
+
+    def _apply_filter(self, text):
+        text = (text or "").strip().lower()
+        for i in range(self.queue.count()):
+            it = self.queue.item(i)
+            it.setHidden(bool(text) and text not in it.data(Qt.UserRole).lower())
+
+    # ---- 交互动作 --------------------------------------------------------
+    def _cycle_mode(self):
+        if self.player is None:
+            return
+        key = self.player.cycle_mode()
+        win = self.parent()
+        if hasattr(win, "settings"):
+            win.settings["music_playback"] = key
+            save_json("settings.json", win.settings)
+
+    def _seek_start(self):
+        self._seeking = True
+
+    def _seek_move(self, pos):
+        self.t_cur.setText(fmt_ms(pos))
+
+    def _seek_apply(self):
+        self._seeking = False
+        self._guard(lambda: self.player.seek_ms(self.progress.value()))
+
+    def _volume_changed(self, v):
+        if self.player is not None:
+            self._guard(lambda: self.player.set_volume(v))
+
+    def _volume_saved(self):
+        win = self.parent()
+        if self.player is not None and hasattr(win, "settings"):
+            win.settings["music_volume"] = self.player.volume()
+            save_json("settings.json", win.settings)
+
+    def _mute_changed(self, on):
+        if self.player is not None:
+            self._guard(lambda: self.player.mute(on))
+
+    def _stop_music(self):
+        win = self.parent()
+        if hasattr(win, "stop_music"):
+            win.stop_music()
+        self._on_state(False)
+
+    def _on_queue_dclick(self, item):
+        if self.player is None:
+            return
+        idx = item.data(Qt.UserRole + 1)
+        self._guard(lambda: self.player.play_at(int(idx)))
+
+    def _import_music(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要导入的音乐", "",
+            "音频文件 ({});;所有文件 (*.*)".format(" ".join(
+                "*" + e for e in AUDIO_EXTS)))
+        if not paths or self.player is None:
+            return
+        n = self.player.add_files(paths)
+        win = self.parent()
+        if hasattr(win, "say"):
+            if n:
+                win.say("麟把 {} 首歌收进曲库啦～马上就能听！".format(n), split=False)
+            else:
+                win.say("唔…这些文件麟收不进来（要真正的音频文件哦）", split=False)
+
+    def _open_folder(self):
+        try:
+            d = external_dir()
+            os.makedirs(d, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(d)
+        except Exception as e:
+            QMessageBox.information(self, "打不开", "没能打开音乐文件夹：{}".format(e))
+
+    def _remove_selected(self):
+        if self.player is None:
+            return
+        row = self.queue.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "先在队列里点选一首要移出的歌～")
+            return
+        idx = self.queue.item(row).data(Qt.UserRole + 1)
+        self._guard(lambda: self.player.remove_at(int(idx)))
+
+    def _restore_all(self):
+        if self.player is None:
+            return
+        keep = ""
+        cur = self._current_tuple()
+        if cur[0] >= 0:
+            keep = cur[1]
+        self._guard(lambda: self.player.restore_all(keep))
+        win = self.parent()
+        if hasattr(win, "say"):
+            win.say("麟把曲库重新翻了一遍，全部 {} 首都回来啦～".format(
+                len(self.player.tracks())), split=False)
+
+    # ---- 封面 -------------------------------------------------------------
+    def _load_cover(self):
+        """优先用 music_cover.png（按麟的四视图生成的封面），缺了就程序自绘占位。"""
+        pix = QPixmap()
+        try:
+            path = resource_path("music_cover.png")
+            if os.path.exists(path):
+                pix.load(path)
+        except Exception:
+            pix = QPixmap()
+        if not pix.isNull():
+            self.cover_lab.setPixmap(pix.scaled(
+                120, 120, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+            return
+        # 占位封面：暖色渐变 + ♪
+        pix = QPixmap(120, 120)
+        p = QPainter(pix)
+        try:
+            g = QLinearGradient(0, 0, 120, 120)
+            g.setColorAt(0.0, QColor("#f7e8d0"))
+            g.setColorAt(1.0, QColor("#e0c9a0"))
+            p.fillRect(0, 0, 120, 120, g)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setPen(QColor("#a8845c"))
+            f = QFont("Microsoft YaHei", 40)
+            f.setBold(True)
+            p.setFont(f)
+            p.drawText(pix.rect(), Qt.AlignCenter, "♪")
+        finally:
+            p.end()
+        self.cover_lab.setPixmap(pix)

@@ -4,6 +4,7 @@
 import os
 import re
 import time
+from pathlib import Path
 
 from config import MEMORY_LOG_DIR, MAX_FACTS, FACT_PATTERNS
 from data import data_dir, load_memory, save_memory
@@ -19,7 +20,10 @@ def memory_log_dir():
 def write_daily_log(d, summary, highlights, facts):
     """把某天的总结写入 memory_log/YYYY-MM-DD.md"""
     try:
-        path = os.path.join(memory_log_dir(), "{}.md".format(d))
+        base = os.path.realpath(memory_log_dir())
+        path = os.path.realpath(os.path.join(base, "{}.md".format(d)))
+        if path != base and not path.startswith(base + os.sep):
+            raise ValueError("日志路径越界: %r" % (d,))
         lines = ["# {} · 麟的记忆日志".format(d), "",
                  "## 今日总结", summary, "",
                  "## 值得记住的事"]
@@ -27,8 +31,7 @@ def write_daily_log(d, summary, highlights, facts):
         if facts:
             lines += ["", "## 新记住的关于幸歌的事"]
             lines += ["- " + f for f in facts]
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
+        Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     except Exception as e:
         print("[记忆日志写入失败]", e)
 

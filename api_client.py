@@ -1,15 +1,54 @@
 # -*- coding: utf-8 -*-
 """API 仓库（原 oc.py 三、四区相关部分）：多 API 配置读写、
 OpenAI 兼容请求（主备自动切换）、连通测试、首次运行向导、信号桥。"""
+import ipaddress
 import json
+import socket
 import threading
 
 import requests
+from urllib.parse import urlparse
 from PyQt5.QtCore import QObject, pyqtSignal
 from PyQt5.QtWidgets import QInputDialog, QLineEdit
 
 from config import DEFAULT_API_CONFIG
 from data import data_dir, load_json, save_json, load_api_key, save_api_key
+
+# 本地接口白名单：readme 明确支持「本地 Ollama」（http://localhost:11434），
+# 环回/私网地址只对该形态放行；其余主机名一律不得指向内网/环回/保留段。
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def check_api_url(url):
+    """发请求前校验用户配置的接口地址（纵深防御）。
+
+    规则：仅 http/https；解析出的 IP 一律禁止链路本地（含云元数据
+    169.254.169.254）、保留段与多播；环回/私网仅当主机名本身是
+    localhost 系才放行（同时挡住「公网域名解析到内网 IP」的绕过）。
+    返回 None 表示通过，否则返回拒绝原因字符串。
+    """
+    try:
+        u = urlparse(url)
+        if u.scheme not in ("http", "https"):
+            return "接口地址只支持 http/https"
+        host = (u.hostname or "").strip().lower().rstrip(".")
+        if not host:
+            return "接口地址缺少主机名"
+        is_local_name = host in _LOCAL_HOSTS or host.endswith(".localhost")
+        port = u.port or (443 if u.scheme == "https" else 80)
+        for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+                return "接口地址指向保留/链路本地网段（含云元数据），已拒绝"
+            if (ip.is_loopback or ip.is_private or ip.is_reserved) and not is_local_name:
+                return "非本地主机名不允许指向内网/环回地址"
+        return None
+    except socket.gaierror:
+        return "接口主机名解析失败"
+    except Exception as e:
+        return "接口地址校验失败: {}".format(e)
+
+
 def load_api_config():
     """读取 API 仓库配置；首次运行自动生成，并迁移旧 api_key.txt"""
     cfg = load_json("api_config.json", None)
@@ -35,6 +74,9 @@ def test_api(api):
     key = (api.get("key") or "").strip()
     if not url or not model:
         return False, "接口地址或模型为空"
+    bad = check_api_url(url)
+    if bad:
+        return False, bad
     try:
         headers = {"Content-Type": "application/json"}
         if key:
@@ -79,9 +121,11 @@ class SignalBus(QObject):
     """跨线程信号桥：不同请求类型走不同信号，避免混乱"""
     reply_ready = pyqtSignal(str)       # 普通聊天
     reply_error = pyqtSignal(str)
+    reply_error_kind = pyqtSignal(str, str)  # (错误信息, 请求类型) 让界面能区分是谁失败了
     event_ready = pyqtSignal(str)       # 随机事件 JSON
     food_ready  = pyqtSignal(str)       # 食物评价
     memory_ready = pyqtSignal(str)      # 每日记忆归档 JSON
+    summary_ready = pyqtSignal(str)     # 滚动对话摘要（context_budget 上下文压缩）
     weather_ready = pyqtSignal(str)     # 天气 JSON
     ping_ready  = pyqtSignal(bool, int) # (是否在线, 延迟ms)
 
@@ -101,6 +145,10 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
             key = (api.get("key") or "").strip()
             if not url or not model:
                 continue
+            bad = check_api_url(url)
+            if bad:
+                last_err = bad
+                continue
             local = "localhost" in url.lower() or "127.0.0.1" in url.lower()
             if not key and not local:
                 continue
@@ -115,7 +163,17 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                 if resp.status_code != 200:
                     last_err = "HTTP {}: {}".format(resp.status_code, resp.text[:120])
                     continue
-                content = resp.json()["choices"][0]["message"]["content"]
+                data = resp.json()
+                try:
+                    msg = data["choices"][0]["message"]
+                except (KeyError, IndexError, TypeError):
+                    last_err = "返回格式异常：{}".format(str(data)[:120])
+                    continue
+                content = msg.get("content") or msg.get("reasoning_content") or ""
+                if not str(content).strip():
+                    last_err = "接口返回了空内容"
+                    continue
+                content = str(content)
                 if kind == "chat":
                     bus.reply_ready.emit(content)
                 elif kind == "event":
@@ -124,10 +182,14 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                     bus.food_ready.emit(content)
                 elif kind == "memory":
                     bus.memory_ready.emit(content)
+                elif kind == "summary":
+                    # 滚动摘要：由 PetWindow._on_summary 回填并持久化；失败走 reply_error_kind
+                    bus.summary_ready.emit(content)
                 return
             except Exception as exc:
                 last_err = repr(exc)
         bus.reply_error.emit(last_err)
+        bus.reply_error_kind.emit(last_err, kind)
     threading.Thread(target=run, daemon=True).start()
 
 
