@@ -280,11 +280,8 @@ class PetWindow(QWidget):
         self.net_label.setAlignment(Qt.AlignCenter)
         self.net_label.hide()
 
-        # ---- 雨伞叠加层 ----
-        self.umbrella_label = QLabel(self)
-        self.umbrella_label.setGeometry(120, 250, 200, 240)
-        self.umbrella_label.setAlignment(Qt.AlignCenter)
-        self.umbrella_label.hide()
+        # （雨天撑伞已并入主立绘状态机 _idle_file，不再用叠加层——
+        #   umbrella.png 是完整立绘，叠加会出现"两只麟"）
 
         # ---- 天气小标签（底部状态行中段） ----
         self.weather_label = QLabel("🌐", self)
@@ -386,6 +383,7 @@ class PetWindow(QWidget):
         self._last_clip = None
         self.focus_active = False
         self._focus_trust_until = 0    # 专注监督静默期限（聊天里说了在学习/工作就暂不提醒）
+        self._rainy_weather = False    # 雨雪天待机撑伞（_idle_file 状态机）
         self.focus_end = 0
         self.focus_minutes = 0
         self.sleep_mode = False
@@ -618,13 +616,16 @@ class PetWindow(QWidget):
             self.pet.setPixmap(pix)
 
     def _idle_file(self):
-        """待机图优先级：换装 → 雷雨害怕 → 心情低落 → 好感表情 → 默认"""
+        """待机图优先级：换装 → 雷雨害怕 → 雨雪撑伞 → 心情低落 → 好感表情 → 默认"""
         if self.current_outfit:
             f = "{}_close.png".format(self.current_outfit)
             if os.path.exists(resource_path(f)):
                 return f
         if self.thunder_mode and os.path.exists(resource_path(IMG_THUNDER)):
             return IMG_THUNDER
+        if getattr(self, "_rainy_weather", False) and not self.sleep_mode \
+                and not self.game_mode and os.path.exists(resource_path(IMG_UMBRELLA)):
+            return IMG_UMBRELLA
         if self.mood_value < 40 and os.path.exists(resource_path(IMG_SAD)):
             return IMG_SAD
         if self.affinity < 30 and os.path.exists(resource_path(IMG_LOW)):
@@ -715,7 +716,6 @@ class PetWindow(QWidget):
         self.bubble.setGeometry(int(6 * s), int(8 * s), int(328 * s), int(118 * s))
         self.pet.setGeometry(int(10 * s), int(126 * s), int(320 * s), int(392 * s))
         self.net_label.setGeometry(int(288 * s), int(128 * s), int(32 * s), int(32 * s))
-        self.umbrella_label.setGeometry(int(120 * s), int(250 * s), int(200 * s), int(240 * s))
         self.clip_overlay.setGeometry(int(6 * s), int(122 * s), int(328 * s), int(44 * s))
         # 事件覆盖层放在桌宠本体区域中部，绝不下探到底部输入框（y≈in_y）
         ov_h = int(max(92, 122 * s))
@@ -2611,7 +2611,6 @@ class PetWindow(QWidget):
         self.dlg_state = "idle"
         self.bubble.hide()
         self.clip_overlay.hide()
-        self.umbrella_label.hide()
         self.pose = "sleep"
         self._show(IMG_SLEEP if os.path.exists(resource_path(IMG_SLEEP)) else IMG_BACK)
 
@@ -2995,7 +2994,6 @@ class PetWindow(QWidget):
                     pass
             self.dlg_state = "idle"
             self.bubble.hide()
-            self.umbrella_label.hide()
             screen = QApplication.primaryScreen().availableGeometry()
             self.move(screen.right() - self.width() - 10, screen.bottom() - self.height() - 10)
             self.say("（麟轻轻缩到角落里，不敢打扰你打游戏…）", split=False)
@@ -3125,27 +3123,16 @@ class PetWindow(QWidget):
             self.weather_label.hide()
         # 雷雨天气：待机显示害怕表情（thunder.png）
         self.thunder_mode = any(k in cn for k in ["雷", "冰雹"])
+        # 雨雪天气：待机直接换成撑伞立绘（umbrella.png 是完整立绘，
+        # 曾经用叠加层叠在主立绘上会变成"两只麟"，已废弃）
+        self._rainy_weather = any(k in cn for k in ["雨", "雪", "雷", "毛毛雨", "阵雨", "雹"])
         if self.thunder_mode and not self.sleep_mode and not self.game_mode:
             self._show(IMG_THUNDER if os.path.exists(resource_path(IMG_THUNDER)) else self._idle_file())
         elif not self.thunder_mode and self.pose in ("idle",):
-            self._show(self._idle_file())
-        rainy = any(k in cn for k in ["雨", "雪", "雷", "毛毛雨", "阵雨", "雹"])
-        if rainy:
-            if (not self.sleep_mode and not self.game_mode
-                    and os.path.exists(resource_path(IMG_UMBRELLA))):
-                pix = QPixmap(resource_path(IMG_UMBRELLA))
-                if not pix.isNull():
-                    self.umbrella_label.setPixmap(pix.scaled(
-                        int(180 * self.scale), int(220 * self.scale),
-                        Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                    self.umbrella_label.show()
-            else:
-                self.umbrella_label.hide()
-            if time.time() - self._last_wx_msg > 3600:
-                self._last_wx_msg = time.time()
-                self.say("外面{}，{}℃～幸歌出门记得带伞哦！".format(cn, temp), split=False)
-        else:
-            self.umbrella_label.hide()
+            self._show(self._idle_file())   # 含雨天撑伞（见 _idle_file）
+        if self._rainy_weather and time.time() - self._last_wx_msg > 3600:
+            self._last_wx_msg = time.time()
+            self.say("外面{}，{}℃～幸歌出门记得带伞哦！".format(cn, temp))
 
     # ---------- 14 剪贴板互动 ----------
     def _on_clipboard_changed(self):
