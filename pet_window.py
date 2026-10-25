@@ -978,7 +978,10 @@ class PetWindow(QWidget):
                     r.get("intensity", 3),
                     ("[" + "、".join(r.get("tags", [])) + "]") if r.get("tags") else "")
                 for r in recs)
-            parts.append("【幸歌最近的情绪记录】{}。请温柔回应，不要指责、说教或强行讲道理。".format(seg))
+            parts.append("【幸歌最近的情绪记录】{}。这只是背景参考（可能是很久前或一瞬间的记录），"
+                         "不是现在的他。请温柔回应，不要指责、说教或强行讲道理；"
+                         "**如果幸歌亲口说自己没事、开心、或不想聊这个话题，请完全相信并尊重他的表述，"
+                         "顺着他的心情聊轻松的事，绝不要再追问、质疑或把话题拉回情绪——同一话题最多提一次。**".format(seg))
         asm = recent_assessment()
         if asm:
             parts.append("【幸歌最近的心理评测】{}（{}分，满分{}）。请温和共情、不评判不说教；"
@@ -987,7 +990,9 @@ class PetWindow(QWidget):
         mood_txt = {"happy": "心情很好，说话要更活泼开朗",
                     "normal": "心情平稳",
                     "sad": "心情低落，回答要简短、带一点没精神的感觉"}[self.mood]
-        parts.append("【当前情绪】{}（数值{}）。{}".format(
+        parts.append("【当前情绪】{}（数值{}）。{}"
+                     "注意：这是系统的粗略推测，**不是幸歌亲口说的**——如果他否认（说自己很好/没事），"
+                     "请直接相信他，自然地聊下去，不要拿这个推测反复追问。".format(
             mood_txt, self.mood_value,
             "悲伤情绪下句子控制在30字内。" if self.mood == "sad" else ""))
         lv = self._aff_level_name()
@@ -2157,8 +2162,8 @@ class PetWindow(QWidget):
         if text.startswith("#"):
             self._handle_command(text)
             return
-        # 聊天框功能调用（自然语言）：专注 N 分钟 / 取消专注——本地处理不发 AI
-        if self._try_focus_intent(text):
+        # 聊天框功能调用（自然语言指挥桌宠工具）：命中即本地处理不发 AI
+        if self._try_tool_intent(text):
             return
         if self.busy:
             self._chat_reply_out("麟还在想刚才的问题呢，等一下下嘛～")
@@ -2762,17 +2767,108 @@ class PetWindow(QWidget):
             self.say("好哒，幸歌是在认真学习/工作呀～麟就先不催啦！（监督静默 30 分钟，#恢复监督 可提前开启）",
                      split=False)
 
-    def _try_focus_intent(self, text):
-        """聊天框里的自然语言功能调用（专注相关）：命中并处理返回 True（不再发 AI）。"""
+    def _say_net_status(self):
+        self.say("当前网络{}，延迟约{}ms。".format("正常" if self.net_ok else "异常", self.net_ms),
+                 split=False)
+
+    def _try_tool_intent(self, text):
+        """聊天框功能调用（自然语言指挥桌宠工具）：命中并处理返回 True
+        （不再发 AI）。覆盖专注计时、音乐控制、面板开关、状态问询、互动。
+        模式刻意收紧：只有明确的动词+名词组合才动作，避免聊天误触发。"""
         t = (text or "").strip()
         if not t:
             return False
-        m = re.search(r"专注\s*(\d+)\s*分钟", t)
-        if m:
-            self.start_focus(max(1, min(180, int(m.group(1)))))
+
+        def _say(s):
+            self._chat_reply_out(s)
+
+        # ---- 专注计时 ----
+        if "专注" in t or re.search(r"计时|倒计时", t):
+            if re.search(r"(取消|结束|停止|退出|关掉|不要)(.{0,4}专注|.{0,4}计时)|不(专注|计时)了", t):
+                self.cancel_focus()
+                return True
+            m = (re.search(r"专注[^\d]{0,8}(\d{1,3})\s*分钟", t)
+                 or re.search(r"计时[^\d]{0,4}(\d{1,3})\s*分钟", t)
+                 or re.search(r"(\d{1,3})\s*分钟[^\d]{0,4}(专注|计时)", t))
+            if m:
+                self.start_focus(max(1, min(180, int(m.group(1)))))
+                return True
+            if re.search(r"(打开|开启|开始|启动|进入)(.{0,3}专注)?|专注(模式|时钟)?$|来一(场|次)专注", t) \
+                    and ("专注" in t or "计时" in t):
+                self.start_focus(25)
+                return True
+            if t in ("专注", "专注模式", "计时"):
+                self.start_focus(25)
+                return True
+
+        # ---- 音乐控制 ----
+        if re.search(r"(下一首|换一首|切歌|跳过这首)", t):
+            mf = self.music_player()
+            if mf and self.music_mode:
+                mf.next()
+                _say("换歌啦～听这首怎么样？")
+            else:
+                _say("麟还没开始放歌哦，说\"放首歌\"麟就开播～")
             return True
-        if self.focus_active and re.search(r"(取消|结束|停止|退出)专注|不专注了|专注取消|别计时了", t):
-            self.cancel_focus()
+        if re.search(r"(暂停|先停一下)(音乐|歌|播放|一下)$|暂停$", t) and self.music_mode:
+            mf = self.music_player()
+            if mf:
+                mf.toggle()
+                _say("音乐暂停啦，想继续就说\"继续播放\"～")
+            return True
+        if re.search(r"(继续|恢复)播放|继续放|接着放", t) and self.music_mode:
+            mf = self.music_player()
+            if mf:
+                mf.toggle()
+                _say("音乐继续～")
+            return True
+        if re.search(r"(停止|别放|关掉)(音乐|歌)", t):
+            self.stop_music()
+            return True
+        if re.search(r"(放|播放|来|点)(一)?(首|个)?歌|放点?音乐|来点音乐|听歌|打开播放器|音乐播放器", t):
+            self.open_music_panel()
+            return True
+
+        # ---- 打开面板 ----
+        panels = [("设置", "open_settings"), ("情绪记录", "open_mood_record"),
+                  ("情绪历史", "open_mood_history"), ("情绪统计", "open_mood_stats"),
+                  ("心理评测", "open_assessment"), ("评测", "open_assessment"),
+                  ("帮助", "open_help"), ("历史记录", "open_history"),
+                  ("商城", "open_shop"), ("日程", "open_schedule"),
+                  ("笔记", "open_note"), ("天气", "_weather_check"),
+                  ("网络检测", "_say_net_status"), ("危机支持", "open_crisis")]
+        if re.search(r"打开|看看|查看|展示", t):
+            for name, method in panels:
+                if name in t:
+                    fn = getattr(self, method, None)
+                    if fn:
+                        fn()
+                        if method not in ("_weather_check",):
+                            _say("好嘞，{}打开啦～".format(name))
+                        return True
+
+        # ---- 状态问询 ----
+        if re.search(r"天气(怎么样|如何)?|今天天气|外面(什么情况|怎么样)", t) and "打开" not in t:
+            self.say("外面{}，{}℃～".format(self.weather or "未知",
+                     getattr(self, "weather_temp", "") or "?"), split=False)
+            self._weather_check()
+            return True
+        if re.search(r"(现在)?几点(了|啦|钟)?|什么时间", t) and len(t) <= 12:
+            h = int(time.strftime("%H"))
+            hello = ("早上好呀" if h < 11 else "中午好" if h < 14 else
+                     "下午好" if h < 18 else "晚上好" if h < 23 else "这么晚还没睡呀")
+            _say("现在是{}，{}！".format(time.strftime("%H:%M"), hello))
+            return True
+
+        # ---- 互动彩蛋 ----
+        if re.search(r"摸(一)?摸(头|你|麟)|摸头", t):
+            self.add_affinity(2)
+            self.start_wag()
+            _say("呜嘿嘿……麟的毛被摸得竖起来了，好舒服～好感+2！")
+            return True
+        if re.search(r"^抱抱$|抱抱(你|麟)", t):
+            self.add_affinity(2)
+            _say("（张开小短手抱紧）麟充好电了！幸歌也要元气满满哦～")
             return True
         return False
 

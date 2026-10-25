@@ -7,14 +7,14 @@ import time
 import random
 import shutil
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QPainter, QLinearGradient, QColor, QFont
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QLabel, QLineEdit, QPushButton, QHBoxLayout,
     QVBoxLayout, QFrame, QPlainTextEdit, QSpinBox, QSlider, QFormLayout,
     QListWidget, QListWidgetItem, QGridLayout, QFileDialog, QMessageBox,
     QTextBrowser, QTimeEdit, QDialogButtonBox, QCheckBox, QWidget,
-    QRadioButton, QStackedWidget, QScrollArea, QProgressBar)
+    QRadioButton, QStackedWidget, QScrollArea, QProgressBar, QComboBox)
 
 from config import SHOP_ITEMS, MEMORY_LOG_DIR
 from data import data_dir, resource_path, load_json, save_json, load_log, save_log
@@ -83,7 +83,14 @@ class ChatWindow(QDialog):
     itemWidget 的 sizeHint 对自动换行的 QLabel 不可靠，长文本会被裁边）；
     气泡内边距用 QLabel.setMargin（会计入 sizeHint），样式表只负责
     底色/圆角/描边，从根上避免「字被气泡边框吃掉」。
+
+    流式节奏：网络增量到达后先进缓冲队列，由 QTimer 按用户设置的速度
+    （settings.stream_speed：instant/fast/medium/slow）逐批上屏——网络再快
+    也不糊屏，打字节奏自己定。
     """
+    STREAM_STEPS = {"instant": (999, 0), "fast": (4, 18),
+                    "medium": (2, 34), "slow": (1, 55)}
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.parent_win = parent
@@ -95,6 +102,17 @@ class ChatWindow(QDialog):
         self.setMinimumSize(480, 520)
         self._rows = 0                 # 消息行数（探针/统计用）
         self._stream_label = None      # 流式输出中的那个气泡（None=没有）
+        self._stream_text = ""         # 流式气泡当前全文
+        self._stream_buf = ""          # 待上屏的缓冲字符
+        speed = "medium"
+        try:
+            speed = str((getattr(parent, "settings", {}) or {})
+                        .get("stream_speed", "medium"))
+        except Exception:
+            pass
+        self._stream_speed = speed if speed in self.STREAM_STEPS else "medium"
+        self._stream_timer = QTimer(self)
+        self._stream_timer.timeout.connect(self._flush_stream)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
         tip = QLabel("同一场对话：这里发的消息 = 气泡模式的消息。关掉窗口（或点「回到气泡」）就切回桌宠气泡～")
@@ -139,6 +157,8 @@ class ChatWindow(QDialog):
     # ---- 对外接口 ----
     def load_history(self, history):
         """打开时把当前对话（win.history）装进来"""
+        self._stream_timer.stop()
+        self._stream_buf = ""
         while self._vbox.count() > 1:
             item = self._vbox.takeAt(0)
             w = item.widget()
@@ -168,7 +188,8 @@ class ChatWindow(QDialog):
 
     # ---- 流式输出（api_client.ask_llm_stream 经 PetWindow 转发增量） ----
     def append_stream(self, piece):
-        """流式增量：第一条增量开一个麟的气泡，之后的增量都写进同一个。"""
+        """流式增量：第一条增量开一个麟的气泡，之后的增量写进同一个。
+        网络增量先进缓冲，由 QTimer 按设置的节奏上屏（instant 直接上）。"""
         piece = str(piece or "")
         if not piece:
             return
@@ -176,14 +197,37 @@ class ChatWindow(QDialog):
             self._add_row("assistant", piece, stream=True)
         else:
             self._stream_text += piece
-            self._set_bubble_text(self._stream_label, self._stream_text)
+            if self._stream_speed == "instant":
+                self._set_bubble_text(self._stream_label, self._stream_text)
+                self._scroll_to_bottom()
+                return
+            self._stream_buf += piece
+            n, ms = self.STREAM_STEPS[self._stream_speed]
+            if not self._stream_timer.isActive():
+                self._stream_timer.start(ms)
+
+    def _flush_stream(self):
+        """把缓冲里的字符按设定节奏搬到气泡上。"""
+        if self._stream_label is None or not self._stream_buf:
+            self._stream_timer.stop()
+            return
+        n, _ms = self.STREAM_STEPS[self._stream_speed]
+        take = self._stream_buf[:n]
+        self._stream_buf = self._stream_buf[n:]
+        shown = self._stream_text[:len(self._stream_text) - len(self._stream_buf)]
+        self._set_bubble_text(self._stream_label, shown)
         self._scroll_to_bottom()
+        if not self._stream_buf:
+            self._stream_timer.stop()
 
     def has_stream_bubble(self):
         return self._stream_label is not None
 
     def end_stream(self, full_text):
-        """流式收尾：用完整文本定稿（服务端全文替换分片拼装，防串字）。"""
+        """流式收尾：停掉节奏定时器，用完整文本定稿（服务端全文替换分片
+        拼装，防串字、也保证收尾瞬间补齐缓冲里没上完的字）。"""
+        self._stream_timer.stop()
+        self._stream_buf = ""
         if self._stream_label is not None:
             self._set_bubble_text(self._stream_label, str(full_text or "").strip())
             self._stream_label = None
@@ -1640,6 +1684,22 @@ class SettingsDialog(QDialog):
         self.mood_check.setChecked(bool(parent.settings.get("chat_mood_summary", False)))
         lay.addWidget(self.mood_check)
 
+        # 聊天窗口流式输出速度（网络增量先进缓冲，按此节奏上屏）
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("💬 聊天窗口流式速度："))
+        self.stream_combo = QComboBox()
+        self._stream_items = [("慢速（一笔一画）", "slow"), ("适中（打字机感）", "medium"),
+                              ("快速", "fast"), ("瞬间（网络多快就多快）", "instant")]
+        for label, val in self._stream_items:
+            self.stream_combo.addItem(label, val)
+        cur = str(parent.settings.get("stream_speed", "medium"))
+        idx = max(0, [v for _l, v in self._stream_items].index(cur)
+                  if cur in [v for _l, v in self._stream_items] else 2)
+        self.stream_combo.setCurrentIndex(idx)
+        srow.addWidget(self.stream_combo)
+        srow.addStretch(1)
+        lay.addLayout(srow)
+
         h = QHBoxLayout()
         reset_btn = QPushButton("恢复默认")
         reset_btn.setStyleSheet("QPushButton{background:#e0c9a8;color:#3d2b1f;border:none;border-radius:8px;padding:6px 12px;}")
@@ -1669,6 +1729,7 @@ class SettingsDialog(QDialog):
         self.wt_slider.setValue(60)
         self.top_check.setChecked(True)
         self.mood_check.setChecked(False)
+        self.stream_combo.setCurrentIndex(2)
 
     def save_settings(self):
         win = self.parent
@@ -1680,6 +1741,7 @@ class SettingsDialog(QDialog):
         win.settings["event_max"] = evt_max // 60
         win.settings["event_weight"] = self.wt_slider.value()
         win.settings["chat_mood_summary"] = self.mood_check.isChecked()
+        win.settings["stream_speed"] = self.stream_combo.currentData()
         save_json("settings.json", win.settings)
         win.idle_timeout = self.chat_spin.value() * 60
         win.event_min = evt_min
