@@ -257,11 +257,21 @@ class PetWindow(QWidget):
 
         # ---- 专注倒计时标签（状态行左侧，与好感度条/天气互斥显示） ----
         self.focus_label = QLabel("⏱ 00:00", self)
-        self.focus_label.setGeometry(6, 496, 244, 24)
+        self.focus_label.setGeometry(6, 496, 218, 24)
         self.focus_label.setStyleSheet(
             "background:rgba(40,28,20,235);color:#ffe9c9;border-radius:12px;padding:4px 8px;font-size:12px;")
         self.focus_label.setAlignment(Qt.AlignCenter)
         self.focus_label.hide()
+        # 专注取消按钮：紧贴倒计时右侧，只在专注中显示
+        self.focus_cancel_btn = QPushButton("✕", self)
+        self.focus_cancel_btn.setGeometry(226, 496, 24, 24)
+        self.focus_cancel_btn.setToolTip("取消专注时钟")
+        self.focus_cancel_btn.setStyleSheet(
+            "QPushButton{background:#e8b7a0;border:none;border-radius:6px;"
+            "color:#5a2f1d;font-size:12px;font-weight:bold;}"
+            "QPushButton:hover{background:#e09a7c;}")
+        self.focus_cancel_btn.clicked.connect(self.cancel_focus)
+        self.focus_cancel_btn.hide()
 
         # ---- 网络状态小图标 ----
         self.net_label = QLabel("📵", self)
@@ -375,6 +385,7 @@ class PetWindow(QWidget):
         self._last_pet_time = 0
         self._last_clip = None
         self.focus_active = False
+        self._focus_trust_until = 0    # 专注监督静默期限（聊天里说了在学习/工作就暂不提醒）
         self.focus_end = 0
         self.focus_minutes = 0
         self.sleep_mode = False
@@ -767,10 +778,14 @@ class PetWindow(QWidget):
             mx = int(6 * s) + w_w + max(2, int(4 * s))
             self.mode_label.setGeometry(mx, st_y, m_w, st_h)
             # 专注时 focus 使用天气的位置（天气会隐藏），宽度截止到模式标签前，避免重叠
-            self.focus_label.setGeometry(int(6 * s), st_y, mx - int(6 * s) - 2, st_h)
+            fw = max(30, mx - int(6 * s) - st_h - 4)
+            self.focus_label.setGeometry(int(6 * s), st_y, fw, st_h)
+            self.focus_cancel_btn.setGeometry(int(6 * s) + fw + 2, st_y, st_h, st_h)
         else:
             self.aff_bar.setGeometry(int(6 * s), st_y, int(150 * s), st_h)
-            self.focus_label.setGeometry(int(6 * s), st_y, int(244 * s), st_h)
+            fw = int(218 * s)
+            self.focus_label.setGeometry(int(6 * s), st_y, fw, st_h)
+            self.focus_cancel_btn.setGeometry(int(6 * s) + fw + 2, st_y, st_h, st_h)
             self.weather_label.setGeometry(int(162 * s), st_y, int(88 * s), st_h)
             self.mode_label.setGeometry(int(256 * s), st_y, int(78 * s), st_h)
         # 好感度条内部：爱心字号、进度条宽度、内边距随缩放
@@ -1455,6 +1470,8 @@ class PetWindow(QWidget):
         anim.start()
 
     def _on_bubble_click(self):
+        if self.dlg_state == "focus":
+            return                      # 倒计时气泡：点击不触发旧台词
         if self.dlg_state == "typing":
             self.type_timer.stop()
             self.mouth_timer.stop()
@@ -2140,6 +2157,9 @@ class PetWindow(QWidget):
         if text.startswith("#"):
             self._handle_command(text)
             return
+        # 聊天框功能调用（自然语言）：专注 N 分钟 / 取消专注——本地处理不发 AI
+        if self._try_focus_intent(text):
+            return
         if self.busy:
             self._chat_reply_out("麟还在想刚才的问题呢，等一下下嘛～")
             return
@@ -2148,6 +2168,8 @@ class PetWindow(QWidget):
         self._trim_history()
         self._chat_window_append("user", text)   # 聊天窗口开着就同步显示
         append_log("user", text)
+        # 专注中听到"我在学习/查资料"等 → 监督静默 30 分钟（不影响继续 AI 聊天）
+        self._focus_maybe_trust(text)
         # 即时记住用户透露的事实（本地规则，静默保存，越用越懂）
         self._extract_facts_local(text)
         # 根据用户语气预约回复完成后要播放的表情
@@ -2176,7 +2198,7 @@ class PetWindow(QWidget):
             return
         self.busy = True
         # 思考中形象：API 等待期间显示 thinking.png（缺图自动回退待机）
-        if not self.sleep_mode and not self.game_mode and self.dlg_state == "idle" \
+        if not self.sleep_mode and not self.game_mode and self.dlg_state in ("idle", "focus") \
                 and self.pose in ("idle", "work", "wag"):
             self.pose = "thinking"
             self._show(IMG_THINK if os.path.exists(resource_path(IMG_THINK)) else self._idle_file())
@@ -2297,6 +2319,18 @@ class PetWindow(QWidget):
         cmd = text[1:].strip()
         if cmd.startswith("聊天窗口") or cmd.startswith("窗口"):
             self.open_chat_window()
+        elif cmd.startswith("取消专注") or cmd.startswith("结束专注"):
+            self.cancel_focus()
+        elif cmd.startswith("暂停监督") or cmd.startswith("我在学习") or cmd.startswith("我在工作"):
+            if self.focus_active:
+                self._focus_trust_until = time.time() + 30 * 60
+                self.say("收到！麟先不催你啦，安心学习/工作～（监督静默 30 分钟，#恢复监督 可提前开启）",
+                         split=False)
+            else:
+                self.say("现在没有在专注哦，不需要静默监督～", split=False)
+        elif cmd.startswith("恢复监督"):
+            self._focus_trust_until = 0
+            self.say("好！麟重新帮你盯着～专心哦！", split=False)
         elif cmd.startswith("好感"):
             lv = self._aff_level_name()
             self.say("当前好感度 {}（{}）～{}".format(self.affinity, lv[1], lv[2]), split=False)
@@ -2630,6 +2664,9 @@ class PetWindow(QWidget):
                 txt = "专注 {:d}:{:02d}:{:02d}".format(hh, mm, ss) if hh > 0 else "专注 {:02d}:{:02d}".format(mm, ss)
             self.focus_label.setText(txt)
             self.focus_label.show()
+            self.focus_cancel_btn.show()
+            # 倒计时同时上气泡（更显眼）：空闲时常驻，被聊天借用后自动回来
+            self._focus_bubble_refresh(txt)
             # 专注期间：天气（顶部）与好感度条（左下同位置）让位给倒计时，避免重叠
             self.weather_label.hide()
             if self.aff_bar.isVisible():
@@ -2637,6 +2674,9 @@ class PetWindow(QWidget):
                 self._aff_was_visible = True
         else:
             self.focus_label.hide()
+            self.focus_cancel_btn.hide()
+            if self.dlg_state == "focus":
+                self._fade_out()      # 清掉可能残留的倒计时气泡
             if self.weather:
                 self.weather_label.show()
             if getattr(self, "_aff_was_visible", False):
@@ -2660,7 +2700,81 @@ class PetWindow(QWidget):
         self.focus_minutes = minutes
         self.focus_end = time.time() + minutes * 60
         self.focus_active = True
+        self._focus_trust_until = 0
         self.say("专注时钟启动！目标{}分钟，加油哦幸歌～".format(minutes), split=False)
+
+    def cancel_focus(self):
+        """取消专注（✕ 按钮 / #取消专注 / 聊天里说"取消专注"）。不扣奖励。"""
+        if not self.focus_active:
+            self.say("现在没有在专注哦～要不要来一场？右键 → ⏱ 专注时钟，或者直接跟我说\"专注25分钟\"～", split=False)
+            return
+        self.focus_active = False
+        self._focus_trust_until = 0
+        self.focus_label.hide()
+        self.focus_cancel_btn.hide()
+        if self.dlg_state == "focus":
+            self._fade_out()          # 收起倒计时气泡
+        self.pose = "idle"
+        self._show(self._idle_file())
+        self.say("专注取消了……没关系，状态不好的时候休息更重要！麟随时再陪你～", split=False)
+
+    def _focus_bubble_refresh(self, txt):
+        """把倒计时搬到桌宠气泡上常驻显示（用户要求更显眼）。
+
+        只在「气泡空闲」（dlg_state == idle，没有正在打的字/别的台词）时
+        接管；聊天或事件说这句话时会正常走 say() 抢回气泡，说完淡出回到
+        idle 后，下一秒倒计时自动回来——这就是"聊天时让位、聊完回来"。
+        """
+        if not self.focus_active or self.dlg_state != "idle":
+            return
+        if self.sleep_mode or self.game_mode:
+            return
+        try:
+            if getattr(self, "_fade_anim", None):
+                try:
+                    self._fade_anim.stop()
+                except Exception:
+                    pass
+                self._fade_anim = None
+            self._bubble_effect.setOpacity(1.0)
+            if self.bubble.graphicsEffect() is not self._bubble_effect:
+                self.bubble.setGraphicsEffect(self._bubble_effect)
+            self.bubble.set_content("⏳ " + txt + "\n（✕ 或说\"取消专注\"结束）")
+            self.bubble.show()
+            self.dlg_state = "focus"
+        except Exception:
+            pass
+
+    # 聊天里的学习/工作信号：命中就静默监督 30 分钟（B 站查资料不再被误判成摸鱼）
+    _FOCUS_TRUST_WORDS = ("学习", "复习", "预习", "查资料", "查文献", "看课件", "网课",
+                          "上课", "教程", "做题", "刷题", "作业", "论文", "考研", "考试",
+                          "写报告", "开会", "办公", "整理笔记", "看文档", "调研", "备课",
+                          "画图", "建模", "写方案")
+
+    def _focus_maybe_trust(self, text):
+        """专注中听到学习/工作相关的话 → 监督静默 30 分钟（可 #恢复监督 提前开启）。"""
+        if not self.focus_active or not text:
+            return
+        if time.time() < getattr(self, "_focus_trust_until", 0):
+            return
+        if any(w in text for w in self._FOCUS_TRUST_WORDS):
+            self._focus_trust_until = time.time() + 30 * 60
+            self.say("好哒，幸歌是在认真学习/工作呀～麟就先不催啦！（监督静默 30 分钟，#恢复监督 可提前开启）",
+                     split=False)
+
+    def _try_focus_intent(self, text):
+        """聊天框里的自然语言功能调用（专注相关）：命中并处理返回 True（不再发 AI）。"""
+        t = (text or "").strip()
+        if not t:
+            return False
+        m = re.search(r"专注\s*(\d+)\s*分钟", t)
+        if m:
+            self.start_focus(max(1, min(180, int(m.group(1)))))
+            return True
+        if self.focus_active and re.search(r"(取消|结束|停止|退出)专注|不专注了|专注取消|别计时了", t):
+            self.cancel_focus()
+            return True
+        return False
 
     def _focus_check(self):
         if not self.focus_active:
@@ -2668,7 +2782,9 @@ class PetWindow(QWidget):
         left = self.focus_end - time.time()
         if left <= 0:
             self.focus_active = False
+            self._focus_trust_until = 0
             self.focus_label.hide()
+            self.focus_cancel_btn.hide()
             self.pose = "idle"
             self._show(self._idle_file())
             self.add_coins(20)
@@ -2677,7 +2793,7 @@ class PetWindow(QWidget):
             self.start_wag()
             return
         # 专注中且空闲时显示工作形象（working.png，缺图回退待机）
-        if (not self.sleep_mode and not self.game_mode and self.dlg_state == "idle"
+        if (not self.sleep_mode and not self.game_mode and self.dlg_state in ("idle", "focus")
                 and self.pose == "idle" and os.path.exists(resource_path(IMG_WORK))):
             self.pose = "work"
             self._show(IMG_WORK)
@@ -2687,7 +2803,7 @@ class PetWindow(QWidget):
             bad = any(k in low for k in ["steam", "youtube", "bilibili", "哔哩哔哩", "原神", "genshin",
                                          "英雄联盟", "lol", "dota", "王者荣耀", "抖音", "douyin",
                                          "netflix", "twitch", "discord", "taptap"])
-            if bad:
+            if bad and time.time() > getattr(self, "_focus_trust_until", 0):
                 self._shake_window()
                 self.say("幸歌！！在专注呢，别偷偷玩游戏啦！", split=False,
                          on_done=self._emotion_after(IMG_ANGRY, 1.0))
