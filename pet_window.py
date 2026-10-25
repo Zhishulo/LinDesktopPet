@@ -45,7 +45,8 @@ from config import *   # 全部常量（图片路径/人设/台词/商城/天气
 from data import (data_dir, resource_path, load_json, save_json, load_api_key,
                   save_api_key, load_log, save_log, append_log,
                   ensure_data_files, load_memory, save_memory, load_settings)
-from api_client import (SignalBus, ask_llm, load_api_config, save_api_config)
+from api_client import (SignalBus, ask_llm, ask_llm_stream, load_api_config,
+                        save_api_config)
 from context_budget import ContextBudget     # 上下文预算 + 滚动摘要（纯 stdlib，不依赖 Qt）
 import listening                             # 听歌状态机（纯 stdlib，不依赖 Qt/winrt）
 import care                                  # 情绪察觉 + 主动关心（纯 stdlib，只读心情/评测）
@@ -428,6 +429,7 @@ class PetWindow(QWidget):
         self.bus.ping_ready.connect(self._on_ping, Qt.QueuedConnection)
         self.bus.summary_ready.connect(self._on_summary, Qt.QueuedConnection)   # 滚动摘要回填
         self.bus.mood_ready.connect(self._on_mood_summary, Qt.QueuedConnection) # 聊天情绪总结回写
+        self.bus.stream_ready.connect(self._on_stream_chunk, Qt.QueuedConnection)  # 聊天窗口流式增量
 
         self.send_btn.clicked.connect(self.send_message)
         self.input.returnPressed.connect(self.send_message)
@@ -2179,7 +2181,10 @@ class PetWindow(QWidget):
             self.pose = "thinking"
             self._show(IMG_THINK if os.path.exists(resource_path(IMG_THINK)) else self._idle_file())
         msgs, _dropped = self._build_chat_messages()
-        ask_llm(msgs, self.bus)
+        if self._chat_window_active():
+            ask_llm_stream(msgs, self.bus)   # 窗口模式：流式逐字输出
+        else:
+            ask_llm(msgs, self.bus)
 
     def _on_reply(self, content):
         self.busy = False
@@ -3345,12 +3350,26 @@ class PetWindow(QWidget):
         except Exception as e:
             print("[聊天窗口] 追加消息失败", e)
 
+    def _on_stream_chunk(self, piece):
+        """流式增量：只进聊天窗口（气泡模式不发流式请求，也不会收到）。"""
+        if not piece or not self._chat_window_active():
+            return
+        try:
+            self._chat_dlg.append_stream(piece)
+        except Exception as e:
+            print("[聊天窗口] 流式追加失败", e)
+
     def _chat_reply_out(self, text, on_done=None):
         """聊天回复的唯一出口：窗口模式显示在窗口里（表情回调立即执行，
-        不用等打字机）；气泡模式照常 say()。其它类型的气泡（随机事件/
-        主动关心/音乐提示）不走这里，不受影响。"""
+        不用等打字机；若刚经历流式输出则就地定稿，不另添一条）；气泡
+        模式照常 say()。其它类型的气泡（随机事件/主动关心/音乐提示）
+        不走这里，不受影响。"""
         if self._chat_window_active():
-            self._chat_window_append("assistant", text)
+            dlg = self._chat_dlg
+            if dlg.has_stream_bubble():
+                dlg.end_stream(text)          # 流式收尾：全文定稿
+            else:
+                dlg.append_message("assistant", text)
             if on_done:
                 on_done()
         else:

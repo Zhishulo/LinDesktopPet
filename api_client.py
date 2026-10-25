@@ -215,6 +215,7 @@ class SignalBus(QObject):
     reply_ready = pyqtSignal(str)       # 普通聊天
     reply_error = pyqtSignal(str)
     reply_error_kind = pyqtSignal(str, str)  # (错误信息, 请求类型) 让界面能区分是谁失败了
+    stream_ready = pyqtSignal(str)       # 聊天流式增量（仅聊天窗口模式使用）
     event_ready = pyqtSignal(str)       # 随机事件 JSON
     food_ready  = pyqtSignal(str)       # 食物评价
     memory_ready = pyqtSignal(str)      # 每日记忆归档 JSON
@@ -295,6 +296,133 @@ def ask_llm(messages, bus, kind="chat", temperature=1.2, max_tokens=400):
                 last_err = _friendly_net_error(exc, exc)
         bus.reply_error.emit(last_err)
         bus.reply_error_kind.emit(last_err, kind)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _checked_stream_post(url, payload, headers):
+    """流式 POST（就地做边界校验，校验规则与 check_api_url 一致的内联版）：
+    ① 仅 http/https；② 解析出的 IP 一律阻断链路本地（含云元数据）/多播/
+    未指定段；③ 环回/私网/保留段仅当主机名是 localhost 系才放行（本地
+    Ollama 形态），其余一律拒绝。校验不过抛 ValueError，绝不发请求。
+    连接失败自动用 trust_env=False 的会话直连重试。"""
+    u = urlparse(url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("接口地址只支持 http/https")
+    host = (u.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        raise ValueError("接口地址缺少主机名")
+    is_local = host in _LOCAL_HOSTS or host.endswith(".localhost")
+    port = u.port or (443 if u.scheme == "https" else 80)
+    for info in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP):
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            raise ValueError("接口地址指向保留/链路本地网段，已拒绝")
+        if (ip.is_loopback or ip.is_private or ip.is_reserved) and not is_local:
+            raise ValueError("非本地主机名不允许指向内网/环回地址")
+    try:
+        return requests.post(url, json=payload, headers=headers,
+                             timeout=(10, 120), stream=True)
+    except Exception:
+        direct = requests.Session()
+        direct.trust_env = False          # 系统代理挂了就绕开直连
+        return direct.post(url, json=payload, headers=headers,
+                           timeout=(10, 120), stream=True)
+
+
+def _stream_one(api, messages, temperature, max_tokens, bus):
+    """对单个 API 发起 SSE 流式请求（入口先过 check_api_url，发请求前
+    在 _checked_stream_post 内再内联校验一次，双保险）。增量经
+    bus.stream_ready 发回；返回 (chunks, err)——err 为 None 且 chunks
+    非空才算成功。"""
+    url = (api.get("base_url") or "").strip()
+    model = (api.get("model") or "").strip()
+    key = (api.get("key") or "").strip()
+    if not url or not model:
+        return [], "接口地址或模型为空"
+    bad = check_api_url(url)
+    if bad:
+        return [], bad
+    payload = {"model": model, "messages": messages, "temperature": temperature,
+               "top_p": 0.9, "max_tokens": max_tokens, "stream": True}
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = "Bearer " + key
+    try:
+        resp = _checked_stream_post(url, payload, headers)
+    except Exception as first:
+        try:
+            direct = requests.Session()
+            direct.trust_env = False
+            resp = direct.post(url, json=payload, headers=headers,
+                               timeout=(10, 120), stream=True)
+        except Exception as second:
+            return [], _friendly_net_error(first, second)
+    try:
+        if resp.status_code != 200:
+            return [], friendly_http_error(resp.status_code, resp.text)
+        chunks = []
+        for raw in resp.iter_lines():
+            if not raw:
+                continue
+            line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+            if not line.startswith("data:"):
+                continue                  # 忽略心跳/注释/空行
+            data = line[5:].strip()
+            if not data:
+                continue
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+                choices = obj.get("choices") or [{}]
+                delta = (choices[0] or {}).get("delta", {}) if choices else {}
+                piece = delta.get("content") or ""
+                if piece:
+                    chunks.append(piece)
+                    bus.stream_ready.emit(piece)
+            except Exception:
+                continue                  # 单行坏 JSON：跳过，不断流
+        return chunks, None
+    except Exception as exc:
+        return chunks, _friendly_net_error(exc, exc)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def ask_llm_stream(messages, bus, temperature=1.2, max_tokens=400):
+    """聊天窗口模式的流式请求：增量发 bus.stream_ready，结束后发
+    bus.reply_ready(完整文本)——_on_reply 既有管线（历史/日志/情绪总结/
+    摘要）完全复用。当前 API 流式失败（不支持/断流/空回包）时自动回退
+    ask_llm 的多 API 普通轮换。"""
+    def run():
+        cfg = load_api_config()
+        if not cfg.get("ai_enabled", True):
+            bus.reply_error.emit("AI_DISABLED")
+            bus.reply_error_kind.emit("AI_DISABLED", "chat")
+            return
+        cur = cfg.get("current", "")
+        apis = [a for a in cfg.get("apis", []) if a.get("enabled")]
+        api = next((a for a in apis if a.get("id") == cur), None)
+        if api is not None:
+            url = (api.get("base_url") or "").lower()
+            local_ok = "localhost" in url or "127.0.0.1" in url
+            if not ((api.get("key") or "").strip() or local_ok):
+                api = None
+        if api is not None:
+            try:
+                chunks, err = _stream_one(api, messages, temperature, max_tokens, bus)
+                full = "".join(chunks).strip()
+                if err is None and full:
+                    bus.reply_ready.emit(full)
+                    return
+                if err:
+                    print("[流式] 失败，回退普通请求:", err)
+            except Exception as exc:
+                print("[流式] 异常，回退普通请求:", exc)
+        ask_llm(messages, bus)   # 回退：完整多 API 轮换
     threading.Thread(target=run, daemon=True).start()
 
 

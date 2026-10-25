@@ -76,9 +76,13 @@ class HistoryDialog(QDialog):
 
 class ChatWindow(QDialog):
     """聊天窗口模式：气泡式的完整对话界面（用户右 / 麟左），与桌宠气泡是
-    同一场对话。开着时聊天回复显示在这里（桌宠不再打字泡），关掉自动回到
-    气泡模式——「自由切换」就是开/关这个窗口。非模态 + 原生标题栏三键，
-    最小化后任务栏可召回（与音乐播放器同款管理方式）。
+    同一场对话。开着时聊天回复显示在这里（支持流式逐字输出），关掉自动
+    回到气泡模式——「自由切换」就是开/关这个窗口。非模态 + 原生标题栏三键。
+
+    显示要点：消息区用 QScrollArea+QVBoxLayout（不用 QListWidget——
+    itemWidget 的 sizeHint 对自动换行的 QLabel 不可靠，长文本会被裁边）；
+    气泡内边距用 QLabel.setMargin（会计入 sizeHint），样式表只负责
+    底色/圆角/描边，从根上避免「字被气泡边框吃掉」。
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,6 +93,8 @@ class ChatWindow(QDialog):
                             | Qt.WindowMaximizeButtonHint
                             | Qt.WindowCloseButtonHint)
         self.setMinimumSize(480, 520)
+        self._rows = 0                 # 消息行数（探针/统计用）
+        self._stream_label = None      # 流式输出中的那个气泡（None=没有）
         lay = QVBoxLayout(self)
         lay.setContentsMargins(10, 8, 10, 8)
         tip = QLabel("同一场对话：这里发的消息 = 气泡模式的消息。关掉窗口（或点「回到气泡」）就切回桌宠气泡～")
@@ -96,16 +102,22 @@ class ChatWindow(QDialog):
         tip.setStyleSheet("color:#8a6f4d;font-size:11px;")
         lay.addWidget(tip)
 
-        self.list = QListWidget()
-        self.list.setStyleSheet(
-            "QListWidget{background:#f7efe2;border:1px solid #e0cdb2;border-radius:10px;}"
-            "QListWidget::item{margin:2px;}")
-        self.list.setVerticalScrollMode(QListWidget.ScrollPerPixel)
-        lay.addWidget(self.list, 1)
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setStyleSheet(
+            "QScrollArea{background:#f7efe2;border:1px solid #e0cdb2;border-radius:10px;}")
+        self._body = QWidget()
+        self._body.setStyleSheet("background:transparent;")
+        self._vbox = QVBoxLayout(self._body)
+        self._vbox.setContentsMargins(8, 8, 8, 8)
+        self._vbox.setSpacing(8)
+        self._vbox.addStretch(1)
+        self._scroll.setWidget(self._body)
+        lay.addWidget(self._scroll, 1)
 
         row = QHBoxLayout()
         self.input = QLineEdit()
-        self.input.setPlaceholderText("和麟说点什么…（Enter 发送，# 开头是指令）")
+        self.input.setPlaceholderText("和麟说点什么…（Enter 发送）")
         self.input.returnPressed.connect(self._send)
         self.input.setStyleSheet(
             "QLineEdit{background:#fdf6ec;border:1px solid #cbb797;border-radius:16px;"
@@ -127,35 +139,76 @@ class ChatWindow(QDialog):
     # ---- 对外接口 ----
     def load_history(self, history):
         """打开时把当前对话（win.history）装进来"""
-        self.list.clear()
+        while self._vbox.count() > 1:
+            item = self._vbox.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._rows = 0
+        self._stream_label = None
         for m in (history or []):
             role = m.get("role", "assistant")
             if role in ("user", "assistant"):
-                self._add_row(role, m.get("content", ""), quiet=True)
+                self._add_row(role, m.get("content", ""))
+        self._scroll_to_bottom()
 
     def append_message(self, role, text):
-        """双方新消息都走这里（用户从桌宠输入框发的也会同步进来）"""
-        self._add_row(role, text, quiet=False)
-
-    # ---- 内部 ----
-    def _add_row(self, role, text, quiet=False):
+        """双方新消息都走这里（用户从桌宠输入框发的也会同步进来）。
+        流式收尾时把最后那个流式气泡定稿，而不是再添一条。"""
         text = str(text or "").strip()
         if not text:
             return
-        import time as _time
-        ts = _time.strftime("%H:%M")
-        bubble = QLabel(text)
+        if role == "assistant" and self._stream_label is not None:
+            self._set_bubble_text(self._stream_label, text)
+            self._stream_label = None
+            self._scroll_to_bottom()
+            return
+        self._add_row(role, text)
+        self._scroll_to_bottom()
+
+    # ---- 流式输出（api_client.ask_llm_stream 经 PetWindow 转发增量） ----
+    def append_stream(self, piece):
+        """流式增量：第一条增量开一个麟的气泡，之后的增量都写进同一个。"""
+        piece = str(piece or "")
+        if not piece:
+            return
+        if self._stream_label is None:
+            self._add_row("assistant", piece, stream=True)
+        else:
+            self._stream_text += piece
+            self._set_bubble_text(self._stream_label, self._stream_text)
+        self._scroll_to_bottom()
+
+    def has_stream_bubble(self):
+        return self._stream_label is not None
+
+    def end_stream(self, full_text):
+        """流式收尾：用完整文本定稿（服务端全文替换分片拼装，防串字）。"""
+        if self._stream_label is not None:
+            self._set_bubble_text(self._stream_label, str(full_text or "").strip())
+            self._stream_label = None
+        else:
+            self.append_message("assistant", full_text)
+        self._scroll_to_bottom()
+
+    # ---- 内部 ----
+    def _add_row(self, role, text, stream=False):
+        bubble = QLabel(str(text or ""))
         bubble.setWordWrap(True)
         bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # 内边距用 setMargin（会计入 sizeHint），样式表不写 padding——
+        # 这是修「文字被气泡裁掉」的关键
+        bubble.setMargin(9)
         if role == "user":
             bubble.setStyleSheet(
-                "background:#e9d9b8;border-radius:12px;padding:8px 13px;"
-                "color:#3d2b1f;font-size:13px;")
+                "background:#e9d9b8;border-radius:12px;color:#3d2b1f;font-size:13px;")
         else:
             bubble.setStyleSheet(
                 "background:#fdf6ec;border:1px solid #e0cdb2;border-radius:12px;"
-                "padding:8px 13px;color:#3d2b1f;font-size:13px;")
-        tlab = QLabel(("幸歌" if role == "user" else "麟") + " · " + ts)
+                "color:#3d2b1f;font-size:13px;")
+        bubble.setMaximumWidth(430)
+        import time as _time
+        tlab = QLabel(("幸歌" if role == "user" else "麟") + " · " + _time.strftime("%H:%M"))
         tlab.setStyleSheet("color:#b9a68c;font-size:10px;")
         box = QWidget()
         v = QVBoxLayout(box)
@@ -163,23 +216,29 @@ class ChatWindow(QDialog):
         v.setSpacing(2)
         v.addWidget(bubble)
         v.addWidget(tlab, 0, Qt.AlignLeft)
-        box.setMaximumWidth(400)
         w = QWidget()
         h = QHBoxLayout(w)
-        h.setContentsMargins(8, 3, 8, 3)
+        h.setContentsMargins(0, 0, 0, 0)
         if role == "user":
             h.addStretch(1)
             h.addWidget(box)
         else:
             h.addWidget(box)
             h.addStretch(1)
-        w.adjustSize()
-        it = QListWidgetItem()
-        it.setSizeHint(w.sizeHint())
-        self.list.addItem(it)
-        self.list.setItemWidget(it, w)
-        if not quiet:
-            self.list.scrollToBottom()
+        # 插在末尾 stretch 之前，保持消息顺序
+        self._vbox.insertWidget(self._vbox.count() - 1, w)
+        self._rows += 1
+        if stream:
+            self._stream_label = bubble
+            self._stream_text = str(text or "")
+
+    def _set_bubble_text(self, bubble, text):
+        bubble.setText(str(text or ""))
+        self._body.adjustSize()      # 文本变高时让滚动区重算内容高度
+
+    def _scroll_to_bottom(self):
+        bar = self._scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _send(self):
         text = self.input.text().strip()
