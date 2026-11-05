@@ -7,14 +7,15 @@ import time
 import random
 import shutil
 
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QLinearGradient, QColor, QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QItemSelectionModel
+from PyQt5.QtGui import QPixmap, QPainter, QLinearGradient, QColor, QFont, QCursor
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QLabel, QLineEdit, QPushButton, QHBoxLayout,
     QVBoxLayout, QFrame, QPlainTextEdit, QSpinBox, QSlider, QFormLayout,
     QListWidget, QListWidgetItem, QGridLayout, QFileDialog, QMessageBox,
     QTextBrowser, QTimeEdit, QDialogButtonBox, QCheckBox, QWidget,
-    QRadioButton, QStackedWidget, QScrollArea, QProgressBar, QComboBox)
+    QRadioButton, QStackedWidget, QScrollArea, QProgressBar, QComboBox,
+    QAbstractItemView, QMenu, QAction, QInputDialog)
 
 from config import SHOP_ITEMS, MEMORY_LOG_DIR
 from data import data_dir, resource_path, load_json, save_json, load_log, save_log
@@ -24,7 +25,12 @@ from mood import (MOOD_TYPES, MOOD_TAGS, INTENSITY_NAMES, CRISIS_LINES,
                   mood_name, mood_emoji)
 from assessment import (SCALES, SCALES_BY_KEY, load_assessments,
                         delete_assessment, add_assessment, scales_by_category)
-from music_folder import fmt_ms, external_dir, AUDIO_EXTS
+from music_folder import fmt_ms, external_dir, AUDIO_EXTS, ZIP_EXTS, MODES
+from playlists import (PlaylistStore, SYSTEM_SCOPES, SYS_ALL, SYS_BUILTIN,
+                       SYS_EXTERNAL, NAME_MAX, FAV_ID, FAV_NAME, track_key, split_key)
+from trash import TRASH_SCOPE, TRASH_NAME, get_store
+
+
 class HistoryDialog(QDialog):
     """1. 历史记录面板：带时间戳 + 每行删除按钮（删除=物理失忆）"""
     def __init__(self, parent=None):
@@ -1684,6 +1690,13 @@ class SettingsDialog(QDialog):
         self.mood_check.setChecked(bool(parent.settings.get("chat_mood_summary", False)))
         lay.addWidget(self.mood_check)
 
+        # 分类夹切换方式：默认「等当前这首歌放完再换队列」，勾上就立即换
+        self.switch_check = QCheckBox(
+            "🎵 切换分类夹时立即更换播放队列（默认：当前这首歌放完再切）")
+        self.switch_check.setChecked(bool(
+            parent.settings.get("playlist_switch_immediate", False)))
+        lay.addWidget(self.switch_check)
+
         # 聊天窗口流式输出速度（网络增量先进缓冲，按此节奏上屏）
         srow = QHBoxLayout()
         srow.addWidget(QLabel("💬 聊天窗口流式速度："))
@@ -1729,6 +1742,7 @@ class SettingsDialog(QDialog):
         self.wt_slider.setValue(60)
         self.top_check.setChecked(True)
         self.mood_check.setChecked(False)
+        self.switch_check.setChecked(False)
         self.stream_combo.setCurrentIndex(2)
 
     def save_settings(self):
@@ -1741,6 +1755,7 @@ class SettingsDialog(QDialog):
         win.settings["event_max"] = evt_max // 60
         win.settings["event_weight"] = self.wt_slider.value()
         win.settings["chat_mood_summary"] = self.mood_check.isChecked()
+        win.settings["playlist_switch_immediate"] = self.switch_check.isChecked()
         win.settings["stream_speed"] = self.stream_combo.currentData()
         save_json("settings.json", win.settings)
         win.idle_timeout = self.chat_spin.value() * 60
@@ -1776,7 +1791,7 @@ class MusicPlayerDialog(QDialog):
                             | Qt.WindowMinimizeButtonHint
                             | Qt.WindowMaximizeButtonHint
                             | Qt.WindowCloseButtonHint)
-        self.setMinimumSize(560, 560)
+        self.setMinimumSize(780, 560)
         # 背景图（bg.jpg 水彩雨巷，用户指定）：paintEvent 里铺满 + 暖色半透明罩；
         # 缺图时退回纯色，绝不因素材缺失打不开面板
         self._bg = QPixmap()
@@ -1796,7 +1811,28 @@ class MusicPlayerDialog(QDialog):
                            "QPushButton:hover{background:rgba(232,213,176,240);}"
                            "QCheckBox{color:#3d2b1f;}")
 
-        lay = QVBoxLayout(self)
+        # ---- 外层：左侧「我的分类夹」导航 + 右侧原有播放界面（需求方案一） ----
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        body = QHBoxLayout()
+        body.setSpacing(8)
+        outer.addLayout(body, 1)
+        self._build_nav()
+        body.addWidget(self._nav_box)
+        right_host = QWidget()
+        lay = QVBoxLayout(right_host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        body.addWidget(right_host, 1)
+
+        # 当前选中的分类夹 + 歌单存储（每次打开面板重新读盘，别的地方改了也能看见）
+        self._cur_scope = SYS_ALL      # 当前队列实际所属的分类夹
+        self._want_scope = None        # 放歌中点了别的分类夹 → 等这首放完再切
+        self._switching = False
+        self._store = PlaylistStore()
+        self._store.ensure_favorites()   # 老版本升级上来也补一个「我喜欢的音乐」
+        self._trash = get_store()        # 回收站（软删除缓存，数据在 playlist/trash.json）
+        self._key_map = None            # 歌单旧键 -> 当前曲库键 的解析缓存（每次刷新作废）
+        self._fav_cache = None          # 收藏夹键集合缓存
 
         # ---- 顶部：封面 + 曲名/来源 ----
         top = QHBoxLayout()
@@ -1831,18 +1867,25 @@ class MusicPlayerDialog(QDialog):
 
         # ---- 控制按钮行 ----
         ctrl = QHBoxLayout()
-        self.mode_btn = QPushButton("🔀 随机播放")
+        # 播放模式按钮：左键点一下轮流切；右键弹菜单直接选四种模式之一
+        self.mode_btn = QPushButton("➡️ 顺序播放")
+        self.mode_btn.setContextMenuPolicy(Qt.CustomContextMenu)
         self.prev_btn = QPushButton("⏮")
         self.play_btn = QPushButton("▶ 播放")
         self.next_btn = QPushButton("⏭")
         self.stop_btn = QPushButton("⏹ 停止")
-        for b in (self.mode_btn, self.prev_btn, self.play_btn, self.next_btn, self.stop_btn):
+        # 喜欢（收藏）按钮：和网易云一样，当前这首点心心就进「我喜欢的音乐」
+        self.fav_btn = QPushButton("♡ 喜欢")
+        self.fav_btn.setToolTip("把当前这首收进「{}」，再点一下取消".format(FAV_NAME))
+        for b in (self.mode_btn, self.prev_btn, self.play_btn, self.next_btn,
+                  self.stop_btn, self.fav_btn):
             b.setFocusPolicy(Qt.NoFocus)
         ctrl.addWidget(self.mode_btn)
         ctrl.addStretch(1)
         ctrl.addWidget(self.prev_btn)
         ctrl.addWidget(self.play_btn)
         ctrl.addWidget(self.next_btn)
+        ctrl.addWidget(self.fav_btn)
         ctrl.addStretch(1)
         ctrl.addWidget(self.stop_btn)
         lay.addLayout(ctrl)
@@ -1864,28 +1907,46 @@ class MusicPlayerDialog(QDialog):
         self.search.setFocusPolicy(Qt.ClickFocus)
         lay.addWidget(self.search)
         self.queue = QListWidget()
+        # 批量选中（多选后可右键「添加到分类夹」），自建分类夹里还能拖拽调序
+        self.queue.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.queue.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.queue.customContextMenuRequested.connect(self._queue_menu)
+        self.queue.model().rowsMoved.connect(self._on_queue_reordered)
         self.queue.itemDoubleClicked.connect(self._on_queue_dclick)
+        self.queue.itemClicked.connect(self._on_queue_clicked)   # 点行首的小心心=收藏
         lay.addWidget(self.queue, 1)
 
         # ---- 底部按钮 ----
         bottom = QHBoxLayout()
         imp_btn = QPushButton("📥 导入音乐")
+        imp_btn.setToolTip("可以选音频文件，也可以直接选 zip 压缩包（自动解压）；"
+                           "或者把音频 / zip / 文件夹拖进面板")
         open_btn = QPushButton("📂 打开音乐文件夹")
-        rm_btn = QPushButton("➖ 移除选中")
-        restore_btn = QPushButton("♻️ 恢复全部")
-        for b in (imp_btn, open_btn, rm_btn, restore_btn):
+        self.rm_btn = QPushButton("➖ 移除选中")
+        self.restore_btn = QPushButton("♻️ 恢复全部")
+        # 回收站专用：真的删（导入的歌连本地文件一起删），只在回收站里露出来
+        self.purge_btn = QPushButton("🗑 彻底删除")
+        self.purge_btn.setToolTip("真的删掉：导入的歌连本地文件一起删，删了就回不来了")
+        self.purge_btn.setVisible(False)
+        for b in (imp_btn, open_btn, self.rm_btn, self.restore_btn, self.purge_btn):
             b.setFocusPolicy(Qt.NoFocus)
         bottom.addWidget(imp_btn)
         bottom.addWidget(open_btn)
-        bottom.addWidget(rm_btn)
-        bottom.addWidget(restore_btn)
+        bottom.addWidget(self.rm_btn)
+        bottom.addWidget(self.restore_btn)
+        bottom.addWidget(self.purge_btn)
         bottom.addStretch(1)
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
         bottom.addWidget(close_btn)
         lay.addLayout(bottom)
 
-        tip = QLabel("内置歌曲在 exe 里随身携带；导入的歌复制到 exe 旁 music 文件夹，升级也不丢。"
+        # 拖拽导入：把音频 / zip 压缩包 / 文件夹直接拖进面板（2026-11-06）
+        self.setAcceptDrops(True)
+        tip = QLabel("内置歌曲在 exe 旁 music\\原声 曲库包里（升级只换 exe，曲库不用重下）；"
+                     "导入的音频 / zip 压缩包 / 文件夹直接拖进面板就会自动收进 exe 旁 music 文件夹，升级也不丢。"
+                     "左侧分类夹存在 exe 旁 playlist 文件夹里，换版本也不丢。"
+                     "移出的歌先进「♻ 回收站」，在那儿点「🗑 彻底删除」才是真删。"
                      "标题栏「—」最小化（音乐继续，任务栏召回）；「×」或「关闭」停止播放。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#8a6f4d;font-size:11px;")
@@ -1893,10 +1954,12 @@ class MusicPlayerDialog(QDialog):
 
         # ---- 信号 ----
         self.mode_btn.clicked.connect(self._cycle_mode)
+        self.mode_btn.customContextMenuRequested.connect(self._show_mode_menu)
         self.prev_btn.clicked.connect(lambda: self._guard(self.player.previous))
         self.play_btn.clicked.connect(lambda: self._guard(self.player.toggle))
         self.next_btn.clicked.connect(lambda: self._guard(self.player.next))
         self.stop_btn.clicked.connect(self._stop_music)
+        self.fav_btn.clicked.connect(self._toggle_fav_current)
         self.progress.sliderPressed.connect(self._seek_start)
         self.progress.sliderMoved.connect(self._seek_move)
         self.progress.sliderReleased.connect(self._seek_apply)
@@ -1906,8 +1969,9 @@ class MusicPlayerDialog(QDialog):
         self.search.textChanged.connect(self._apply_filter)
         imp_btn.clicked.connect(self._import_music)
         open_btn.clicked.connect(self._open_folder)
-        rm_btn.clicked.connect(self._remove_selected)
-        restore_btn.clicked.connect(self._restore_all)
+        self.rm_btn.clicked.connect(self._remove_selected)
+        self.restore_btn.clicked.connect(self._restore_all)
+        self.purge_btn.clicked.connect(self._purge_selected)
 
         self._connect_player()
         self._load_cover()
@@ -1922,6 +1986,7 @@ class MusicPlayerDialog(QDialog):
         self.player.modeChanged.connect(self._on_mode)
         self.player.positionChanged.connect(self._on_position)
         self.player.queueChanged.connect(self._refresh_all)
+        self.player.scopeChanged.connect(self._on_scope_changed)
 
     def _disconnect_player(self):
         """关闭面板时摘掉所有信号连接（播放器还要长期用，别让旧面板吃信号）。"""
@@ -1933,6 +1998,7 @@ class MusicPlayerDialog(QDialog):
             self.player.modeChanged.disconnect(self._on_mode)
             self.player.positionChanged.disconnect(self._on_position)
             self.player.queueChanged.disconnect(self._refresh_all)
+            self.player.scopeChanged.disconnect(self._on_scope_changed)
         except Exception:
             pass
 
@@ -1992,7 +2058,12 @@ class MusicPlayerDialog(QDialog):
 
     # ---- 状态刷新 --------------------------------------------------------
     def _refresh_all(self):
+        self._key_map = None
+        self._fav_cache = None
+        self._fill_nav()
         self._fill_queue()
+        self._update_search_hint()
+        self._update_scope_ui()
         if self.player is None:
             self.title_lab.setText("这台电脑放不了歌（缺 QtMultimedia）")
             self.sub_lab.setText("麟会改用八音盒陪你～")
@@ -2023,12 +2094,17 @@ class MusicPlayerDialog(QDialog):
             self.title_lab.setText("还没有开始播放")
             self.sub_lab.setText("")
         self._highlight_current()
+        self._update_fav_btn()
 
     def _on_state(self, playing):
         self.play_btn.setText("⏸ 暂停" if playing else "▶ 播放")
 
     def _on_mode(self, key):
-        self.mode_btn.setText("🔀 " + self.player.__class__.mode_name(key))
+        name = self.player.__class__.mode_name(key) if self.player is not None else key
+        icon = self.MODE_ICONS.get(key, "")
+        self.mode_btn.setText((icon + " " if icon else "") + name)
+        self.mode_btn.setToolTip("点一下轮流切换（顺序 → 列表循环 → 单曲循环 → 随机）\n"
+                                 "右键直接选某个模式")
 
     def _on_position(self, pos, dur):
         if dur > 0:
@@ -2040,44 +2116,233 @@ class MusicPlayerDialog(QDialog):
             self.progress.blockSignals(False)
         self.t_cur.setText(fmt_ms(pos))
 
-    def _highlight_current(self):
-        cur_idx = self._current_tuple()[0]
+    # ---- 喜欢（收藏夹）/ 键解析 ------------------------------------------
+    def _key_maps(self):
+        """当前曲库的两张表：完整键 -> 键、曲名 -> 键（用于兼容老歌单）。"""
+        if self._key_map is not None:
+            return self._key_map
+        by_key, by_title = {}, {}
+        if self.player is not None:
+            for _p, title, source in self.player.library_tracks():
+                k = track_key(source, title)
+                by_key[k] = k
+                by_title.setdefault(title, k)
+        self._key_map = (by_key, by_title)
+        return self._key_map
+
+    def _resolved_key(self, key):
+        """把歌单里存的旧键映射成当前曲库的键。
+
+        上一版内置曲被错标成「本地」，老歌单/收藏里存的是 "本地|曲名"；
+        现在来源改对了，直接比键会全部失配（心心不亮、歌单里的歌全消失）。
+        这里按曲名兜底，让老数据无损迁移。
+        """
+        if not key:
+            return key
+        by_key, by_title = self._key_maps()
+        if key in by_key:
+            return key
+        return by_title.get(split_key(key)[1], key)
+
+    def _fav_keys(self):
+        """收藏夹里的歌（来源已按当前曲库纠正），带缓存避免每行都重算。"""
+        if self._fav_cache is None:
+            self._fav_cache = set(self._resolved_key(k)
+                                  for k in self._store.keys(FAV_ID))
+        return self._fav_cache
+
+    def _is_fav_key(self, key):
+        return bool(key) and self._resolved_key(key) in self._fav_keys()
+
+    def _row_text(self, label, key, is_cur=False):
+        """行文本 = 心心 + 当前曲标记 ♪ + 原标签；心心点一下就收藏/取消。"""
+        heart = "♥" if self._is_fav_key(key) else "♡"
+        return "{} {}{}".format(heart, "♪ " if is_cur else "", label)
+
+    def _refresh_marks(self, keys=None):
+        """只重画心心/当前曲标记，**不动**选中条和滚动位置。
+
+        点♥只是给某一首做个标记，不该改变用户正在看的位置；真正需要「跟着
+        当前曲走」的是切歌（_on_track → _highlight_current）。
+        """
+        targets = None
+        if keys:
+            targets = set(self._resolved_key(k) for k in keys if k)
+        cur_row = self._current_row()
         for i in range(self.queue.count()):
             it = self.queue.item(i)
-            if i == cur_idx:
-                it.setText("♪ " + it.data(Qt.UserRole))
-                font = it.font()
-                font.setBold(True)
-                it.setFont(font)
-            else:
-                it.setText(it.data(Qt.UserRole))
-                font = it.font()
-                font.setBold(False)
-                it.setFont(font)
+            label = it.data(Qt.UserRole)
+            if label is None:
+                continue        # 空分类的占位行
+            k = it.data(Qt.UserRole + 2)
+            if targets is not None and self._resolved_key(k) not in targets:
+                continue
+            it.setText(self._row_text(label, k, i == cur_row))
+
+    def _stored_keys(self, pid, keys):
+        """把列表里显示的键换算成歌单里实际存的键。
+
+        上一版把内置曲错标成「本地」，老歌单里存的是 "本地|曲名"，界面按当前
+        曲库解析后显示的是 "内置|曲名"。直接拿显示键去 remove_tracks 会比不中，
+        表现就是「分类夹里的歌移除不掉」（提示移出 0 首、列表不变）。这里按解析
+        后的键比对，新旧键都能删掉。
+        """
+        want = set(k for k in (keys or []) if k)
+        if not want:
+            return []
+        resolved = set(self._resolved_key(k) for k in want)
+        out = []
+        for k in self._store.keys(pid):
+            if k in want or self._resolved_key(k) in resolved:
+                out.append(k)
+        return out
+
+    def _update_fav_btn(self):
+        cur = self._current_tuple()
+        on = bool(cur[1]) and self._is_fav_key(track_key(cur[2], cur[1]))
+        self.fav_btn.setText("♥ 已喜欢" if on else "♡ 喜欢")
+
+    def _current_row(self):
+        """当前播放曲目在面板列表里的行号；列表不是它的队列（延迟切换中）返回 -1。"""
+        idx, title, source = self._current_tuple()
+        if idx < 0 or not title or self.player is None:
+            return -1
+        cur_key = track_key(source, title)
+        for i in range(self.queue.count()):
+            it = self.queue.item(i)
+            if it is not None and it.data(Qt.UserRole + 2) == cur_key:
+                return i
+        return -1
+
+    def _highlight_current(self):
+        cur_row = self._current_row()
+        for i in range(self.queue.count()):
+            it = self.queue.item(i)
+            label = it.data(Qt.UserRole)
+            if label is None:
+                continue        # 空分类的占位行没有 data，别把提示文字清空
+            it.setText(self._row_text(label, it.data(Qt.UserRole + 2), i == cur_row))
+            font = it.font()
+            font.setBold(i == cur_row)
+            it.setFont(font)
+        self._follow_current(cur_row)
+
+    def _follow_current(self, cur_idx):
+        """让队列的灰色选中条和滚动位置跟着正在放的那首走。
+
+        以前只给当前曲目加 "♪" 并加粗，选中条还停在上一次双击/点过的那首，
+        而当前曲目往往在可视区外——用户看到的就是「高亮的那首」和标题对不上，
+        以为还在放上一首。这里把选中项和滚动一起挪过去。
+        被搜索关键字过滤隐藏时不硬跳，免得把用户正在看的过滤结果顶掉。
+        """
+        try:
+            if cur_idx < 0 or cur_idx >= self.queue.count():
+                return
+            it = self.queue.item(cur_idx)
+            if it is None or it.isHidden():
+                return
+            self.queue.blockSignals(True)
+            try:
+                self.queue.setCurrentItem(it, QItemSelectionModel.ClearAndSelect)
+            finally:
+                self.queue.blockSignals(False)
+            self.queue.scrollToItem(it, QAbstractItemView.EnsureVisible)
+        except Exception:
+            pass
+
+    def _view_tracks(self):
+        """面板列表要显示的曲目。
+
+        延迟切换（放歌中点了别的分类夹）时，列表先切到目标分类夹——用户点了
+        分类夹就该马上看见里面的歌；实际播放队列还是旧的，等这首放完才换。
+        以前这里两份都留在旧分类，用户看到的就是「点了分类夹没反应」。
+        """
+        if self.player is None:
+            return []
+        if not self._want_scope and self._cur_scope == TRASH_SCOPE:
+            return self._scope_tracks(TRASH_SCOPE)   # 回收站：只读展示，不动播放队列
+        sid = self._want_scope
+        if sid and self.player.pending_scope() == sid:
+            return self._scope_tracks(sid)
+        return self.player.tracks()
 
     def _fill_queue(self):
-        self.queue.clear()
+        self.queue.blockSignals(True)
+        try:
+            self.queue.clear()
+        finally:
+            self.queue.blockSignals(False)
         if self.player is None:
             return
-        for i, (path, title, source) in enumerate(self.player.tracks()):
-            it = QListWidgetItem("[{}] {}".format(source, title))
-            it.setData(Qt.UserRole, "[{}] {}".format(source, title))
-            it.setData(Qt.UserRole + 1, i)
+        # 只有自建分类夹里才允许拖动调序（系统分类是过滤视图，顺序无意义）
+        self.queue.setDragDropMode(
+            QAbstractItemView.InternalMove if self._is_user_scope()
+            else QAbstractItemView.NoDragDrop)
+        tracks = self._view_tracks()
+        if not tracks:
+            text = ("回收站是空的～想删的歌先在「全部音乐」里选中，点「➖ 移除选中」"
+                    if self._cur_scope == TRASH_SCOPE
+                    else "该分类暂无音乐，选中歌曲右键即可添加")
+            it = QListWidgetItem(text)
+            it.setFlags(Qt.NoItemFlags)
+            it.setForeground(QColor("#a8845c"))
+            self.queue.addItem(it)
+            self._apply_filter(self.search.text())
+            return
+        for i, (path, title, source) in enumerate(tracks):
+            label = "[{}] {}".format(source, title)
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, label)          # 用来搜索/显示
+            it.setData(Qt.UserRole + 1, i)          # 队列下标
+            it.setData(Qt.UserRole + 2, track_key(source, title))   # 歌单里的稳定键
+            it.setToolTip(path)
             self.queue.addItem(it)
         self._highlight_current()
         self._apply_filter(self.search.text())
 
     def _apply_filter(self, text):
+        """只在当前分类夹范围内过滤（需求 3.3：分类夹内搜索）。"""
         text = (text or "").strip().lower()
         for i in range(self.queue.count()):
             it = self.queue.item(i)
-            it.setHidden(bool(text) and text not in it.data(Qt.UserRole).lower())
+            label = it.data(Qt.UserRole) or it.text() or ""
+            it.setHidden(bool(text) and text not in str(label).lower())
+        self._follow_current(self._current_row())
 
     # ---- 交互动作 --------------------------------------------------------
     def _cycle_mode(self):
         if self.player is None:
             return
         key = self.player.cycle_mode()
+        win = self.parent()
+        if hasattr(win, "settings"):
+            win.settings["music_playback"] = key
+            save_json("settings.json", win.settings)
+
+    def _show_mode_menu(self, pos):
+        """右键模式按钮：直接选四种播放模式（当前模式打勾），不用一下一下轮着点。
+
+        用户反馈「播放器没有随机播放功能」——其实点按钮第四下就是随机，
+        但入口太隐蔽，所以补一个一眼能看到的右键菜单。
+        """
+        if self.player is None:
+            return
+        cur = self.player.mode_key()
+        menu = QMenu(self)
+        for key, name in MODES:
+            icon = self.MODE_ICONS.get(key, "")
+            act = menu.addAction((icon + " " if icon else "") + name)
+            act.setCheckable(True)
+            act.setChecked(key == cur)
+            # 默认参数把 key 绑进 lambda，否则循环里所有菜单项都会指向最后一个模式
+            act.triggered.connect(lambda checked=False, k=key: self._set_mode(k))
+        menu.exec_(self.mode_btn.mapToGlobal(pos))
+
+    def _set_mode(self, key):
+        """直接切到指定模式（右键菜单用）：和点按钮一样会记住到 settings.json。"""
+        if self.player is None:
+            return
+        self.player.set_mode(key)
         win = self.parent()
         if hasattr(win, "settings"):
             win.settings["music_playback"] = key
@@ -2114,25 +2379,168 @@ class MusicPlayerDialog(QDialog):
         self._on_state(False)
 
     def _on_queue_dclick(self, item):
-        if self.player is None:
+        if self.player is None or item is None:
             return
-        idx = item.data(Qt.UserRole + 1)
-        self._guard(lambda: self.player.play_at(int(idx)))
+        key = item.data(Qt.UserRole + 2)
+        if not key:
+            return                      # 空分类的占位行
+        if self._cur_scope == TRASH_SCOPE and not self._want_scope:
+            self._say("回收站里的歌先恢复才能听哦～右键「♻ 恢复」或点「♻ 恢复选中」")
+            return
+        pending = self.player.pending_scope()
+        if pending and self._want_scope == pending:
+            # 正在显示的是「等这首放完才切」的目标分类：双击 = 立刻切过去放
+            self._select_scope(pending, immediate=True)
+        want = self._resolved_key(key)
+        for i, (_p, title, source) in enumerate(self.player.tracks()):
+            if track_key(source, title) == want:
+                self._guard(lambda i=i: self.player.play_at(i))
+                return
+
+    def _on_queue_clicked(self, item):
+        """点行首的 ♥/♡ 就收藏/取消收藏（点别处照常选歌，不打扰）。"""
+        if self.player is None or item is None:
+            return
+        key = item.data(Qt.UserRole + 2)
+        if not key:
+            return
+        if self._cur_scope == TRASH_SCOPE and not self._want_scope:
+            return                      # 回收站里别给删掉的歌点心心
+        try:
+            rect = self.queue.visualItemRect(item)
+            x = self.queue.viewport().mapFromGlobal(QCursor.pos()).x()
+        except Exception:
+            return
+        if rect.left() <= x <= rect.left() + 22:
+            self._toggle_fav([key])
+
+    def _toggle_fav_current(self):
+        cur = self._current_tuple()
+        if cur[0] < 0 or not cur[1]:
+            self._say("先放一首歌，再点心心就能收藏啦～")
+            return
+        self._toggle_fav([track_key(cur[2], cur[1])])
+
+    def _toggle_fav(self, keys):
+        """收藏/取消收藏若干首（存进固定分类夹「我喜欢的音乐」，不动文件）。"""
+        keys = [self._resolved_key(k) for k in (keys or []) if k]
+        if not keys:
+            return
+        d = self._store.ensure_favorites()
+        have = set(d["music_list"])
+        missing = [k for k in keys if k not in have]
+        if missing:
+            n = self._store.add_tracks(FAV_ID, missing)
+            msg = "收进「{}」啦（{} 首）♥".format(FAV_NAME, n)
+        else:
+            drop = set(keys)
+            d["music_list"] = [k for k in d["music_list"]
+                               if self._resolved_key(k) not in drop]
+            self._store.save()
+            msg = "从「{}」拿掉啦（{} 首），文件还在".format(FAV_NAME, len(keys))
+        self._fav_cache = None
+        self._fill_nav()
+        if self._cur_scope == FAV_ID:
+            # 在收藏夹里点♥ = 把这首拿出去，列表少一行，只能重建
+            self._select_scope(FAV_ID)
+        else:
+            # 只重画这几行的心心，不动选中条和滚动位置。
+            # 以前这里调 _highlight_current()，它会 setCurrentItem + scrollToItem
+            # 到正在播放的那首：用户给列表中间的歌点个心，视图立刻被拽走，
+            # 看起来就像「点喜欢就跳转到正在播放的音乐」。
+            self._refresh_marks(keys)
+            self._update_fav_btn()
+        self._say(msg)
 
     def _import_music(self):
+        """「📥 导入音乐」：音频文件、zip 压缩包都能选（拖拽见 _accept_import）。"""
+        audio = " ".join("*" + e for e in AUDIO_EXTS)
+        zips = " ".join("*" + e for e in ZIP_EXTS)
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "选择要导入的音乐", "",
-            "音频文件 ({});;所有文件 (*.*)".format(" ".join(
-                "*" + e for e in AUDIO_EXTS)))
+            self, "选择要导入的音乐（音频或 zip 压缩包）", "",
+            "音频或压缩包 ({} {});;音频文件 ({});;压缩包 ({});;所有文件 (*.*)".format(
+                audio, zips, audio, zips))
+        if not paths:
+            return
+        self._accept_import(paths)
+
+    def _accept_import(self, paths):
+        """导入的真正入口：音频 / zip 压缩包 / 文件夹都走这里，导入后给一句人话。
+
+        zip 会在 music 文件夹里自动解压（面板不用管目录结构），文件夹会递归
+        找里面的音频；结果摘要来自 player.last_import（files/zips/folders/skipped）。
+        """
         if not paths or self.player is None:
             return
-        n = self.player.add_files(paths)
+        try:
+            n = self.player.add_files(paths)
+        except Exception as e:                    # 坏包/没权限都别让面板崩
+            print("[dialogs] 导入音乐失败:", e)
+            return
+        stat = getattr(self.player, "last_import", None) or {}
+        zips = int(stat.get("zips") or 0)
+        folders = int(stat.get("folders") or 0)
+        # 导入会重扫曲库并退回全库范围，把当前分类夹重新套回去
+        try:
+            self._fill_nav()
+            self._select_scope(self._cur_scope)
+        except Exception as e:
+            print("[dialogs] 导入后刷新列表失败:", e)
         win = self.parent()
-        if hasattr(win, "say"):
-            if n:
-                win.say("麟把 {} 首歌收进曲库啦～马上就能听！".format(n), split=False)
+        say = getattr(win, "say", None)
+        if not callable(say):
+            return
+        if n:
+            if zips:
+                msg = "麟从压缩包里解出 {} 首歌，收进曲库啦～马上就能听！".format(n)
+            elif folders:
+                msg = "麟把文件夹里的 {} 首歌收进曲库啦～马上就能听！".format(n)
             else:
-                win.say("唔…这些文件麟收不进来（要真正的音频文件哦）", split=False)
+                msg = "麟把 {} 首歌收进曲库啦～马上就能听！".format(n)
+        elif zips:
+            msg = "这个压缩包里麟没找到能听的音乐（里面要有 mp3 / flac / wav 这些哦）"
+        else:
+            msg = "唔…这些文件麟收不进来（要音频文件、zip 压缩包或者文件夹哦）"
+        try:
+            say(msg, split=False)
+        except TypeError:
+            say(msg)
+
+    @staticmethod
+    def _drop_paths(ev):
+        """从拖拽事件里取出本地路径列表；不是本地文件（网页图片等）一律不要。"""
+        try:
+            md = ev.mimeData()
+            if md is None or not md.hasUrls():
+                return []
+        except Exception:
+            return []
+        out = []
+        for u in md.urls():
+            try:
+                if not u.isLocalFile():
+                    continue
+                p = u.toLocalFile()
+                if p and os.path.exists(p):
+                    out.append(p)
+            except Exception:
+                continue
+        return out
+
+    def dragEnterEvent(self, ev):
+        """把音频 / zip / 文件夹拖进面板就能导入（2026-11-06 加的）。"""
+        if self._drop_paths(ev):
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dropEvent(self, ev):
+        paths = self._drop_paths(ev)
+        if not paths:
+            ev.ignore()
+            return
+        ev.acceptProposedAction()
+        self._accept_import(paths)
 
     def _open_folder(self):
         try:
@@ -2144,27 +2552,697 @@ class MusicPlayerDialog(QDialog):
             QMessageBox.information(self, "打不开", "没能打开音乐文件夹：{}".format(e))
 
     def _remove_selected(self):
+        """移除选中。
+
+        - 系统分类（全部音乐/内置原声/我的导入）：丢进「♻ 回收站」，能恢复；
+          真正的删除要去回收站点「🗑 彻底删除」；
+        - 回收站里：等于「♻ 恢复选中」（把歌拿回曲库）；
+        - 自建分类夹：只解除收纳（不删文件、不进回收站、不影响别的分类）。
+        """
         if self.player is None:
             return
-        row = self.queue.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "提示", "先在队列里点选一首要移出的歌～")
+        rows = sorted(set(self.queue.row(i) for i in self.queue.selectedItems()))
+        if not rows:
+            row = self.queue.currentRow()
+            rows = [row] if row >= 0 else []
+        if not rows:
+            QMessageBox.information(self, "提示", "先在列表里点选要移出的歌～")
             return
-        idx = self.queue.item(row).data(Qt.UserRole + 1)
-        self._guard(lambda: self.player.remove_at(int(idx)))
+        keys, idxs = [], []
+        for r in rows:
+            it = self.queue.item(r)
+            if it is None:
+                continue
+            k = it.data(Qt.UserRole + 2)
+            i = it.data(Qt.UserRole + 1)
+            if k:
+                keys.append(k)
+            if isinstance(i, int) and i >= 0:
+                idxs.append(i)
+        if self._cur_scope == TRASH_SCOPE and not self._want_scope:
+            self._restore_trash(keys)
+            return
+        if self._is_user_scope():
+            pid = self._cur_scope
+            name = self._scope_label(pid)
+            drop = self._stored_keys(pid, keys)
+            n = self._store.remove_tracks(pid, drop) if drop else 0
+            self._fill_nav()
+            self._select_scope(pid)
+            if n:
+                self._say("从「{}」移出 {} 首～文件还在，其他分类也没动".format(name, n))
+            else:
+                self._say("这几首不在「{}」里（可能已经移出过了）".format(name))
+            return
+        # 系统分类：移出曲库 = 先收进回收站（还能反悔），不再一移除就消失
+        view = self._view_tracks()
+        entries = []
+        for i in sorted(set(idxs)):
+            if not (0 <= i < len(view)):
+                continue
+            path, title, source = view[i]
+            k = track_key(source, title)
+            entries.append({"source": source, "title": title, "path": path,
+                            "from_playlists": self._playlists_with(k)})
+        if not entries:
+            return
+        moved = self._trash.add(entries)
+        self._drop_from_playlists(entries)     # 曲库都移出去了，分类夹里也别留着
+        self._fill_nav()
+        self._select_scope(self._cur_scope, immediate=True)
+        self._say("{} 首收进「♻ 回收站」啦～想反悔就点左边回收站恢复".format(moved))
 
     def _restore_all(self):
         if self.player is None:
+            return
+        if self._cur_scope == TRASH_SCOPE and not self._want_scope:
+            self._restore_all_trash()
             return
         keep = ""
         cur = self._current_tuple()
         if cur[0] >= 0:
             keep = cur[1]
         self._guard(lambda: self.player.restore_all(keep))
+        # 重扫后把当前分类夹范围重新套上（自建歌单的文件可能变了）
+        self._select_scope(self._cur_scope)
+        self._say("麟把曲库重新翻了一遍，全部 {} 首都回来啦～".format(
+            len(self.player.library_tracks())))
+
+    # ---- 回收站（软删除缓存） ---------------------------------------------
+    def _update_scope_ui(self):
+        """底部按钮随当前分类变：回收站里给「恢复/彻底删除」，别处是「移除/恢复全部」。"""
+        in_trash = self._cur_scope == TRASH_SCOPE and not self._want_scope
+        self.rm_btn.setText("♻ 恢复选中" if in_trash else "➖ 移除选中")
+        self.rm_btn.setToolTip("把选中的歌放回曲库" if in_trash
+                               else "移出当前列表；系统分类里移出的歌会先进回收站")
+        self.restore_btn.setText("♻ 全部恢复" if in_trash else "♻️ 恢复全部")
+        self.purge_btn.setVisible(in_trash)
+
+    def _playlists_with(self, key):
+        """这首现在被哪些自建分类夹收着（进回收站时记下来，恢复时放回原处）。"""
+        rk = self._resolved_key(key)
+        out = []
+        for d in self._store.playlists:
+            for k in d["music_list"]:
+                if self._resolved_key(k) == rk:
+                    out.append(d["playlist_id"])
+                    break
+        return out
+
+    def _drop_from_playlists(self, entries):
+        """把这几首从所有分类夹里摘掉（只改收纳关系，绝不动文件）。"""
+        want = set(self._resolved_key(track_key(e["source"], e["title"]))
+                   for e in entries)
+        for d in list(self._store.playlists):
+            drop = [k for k in d["music_list"] if self._resolved_key(k) in want]
+            if drop:
+                self._store.remove_tracks(d["playlist_id"], drop)
+
+    def _restore_trash(self, keys):
+        """从回收站恢复：文件从头到尾没动过，只是放回曲库（分类夹也放回原处）。"""
+        keys = [k for k in (keys or []) if k]
+        if not keys:
+            self._say("先在回收站里选中要恢复的歌～")
+            return
+        items = self._trash.restore(keys)
+        if not items:
+            return
+        for d in items:
+            for pid in d.get("from_playlists") or []:
+                if self._store.by_id(pid):
+                    self._store.add_tracks(pid, [d["key"]])
+        # 启动扫描时这些歌被回收站滤掉了，补一次轻量重扫让它们马上回到曲库
+        # （不打断正在放的音乐）
+        self._guard(self.player.refresh_library)
+        self._fill_nav()
+        self._select_scope(self._cur_scope)
+        self._say("{} 首回到曲库啦～".format(len(items)))
+
+    def _restore_all_trash(self):
+        self._restore_trash(self._trash.keys())
+
+    def _purge_selected(self):
+        if self.player is None:
+            return
+        keys = []
+        for it in self.queue.selectedItems():
+            k = it.data(Qt.UserRole + 2)
+            if k and k not in keys:
+                keys.append(k)
+        if not keys:
+            row = self.queue.currentRow()
+            it = self.queue.item(row) if row >= 0 else None
+            k = it.data(Qt.UserRole + 2) if it is not None else None
+            if k:
+                keys.append(k)
+        if not keys:
+            self._say("先在回收站里选中要彻底删掉的歌～")
+            return
+        self._purge_trash(keys)
+
+    def _purge_trash(self, keys):
+        """彻底删除：导入的歌连本地文件一起删；内置原声属于曲库包，不替用户删，
+        只记进屏蔽表（永远不再出现；文件一个都不动，想找回来得清掉 playlist/trash.json
+        里的屏蔽记录——换台电脑则是天然恢复）。回收站里点
+        「彻底删除」就是最后一道确认，不再弹二次确认框（用户要求：都确认删除
+        了就是真删，不用再问）。"""
+        keys = [k for k in (keys or []) if k]
+        if not keys:
+            return
+        want = set(keys)
+        items = [d for d in self._trash.items if d["key"] in want]
+        if not items:
+            return
+        try:
+            ext_root = os.path.abspath(external_dir())
+        except Exception:
+            ext_root = ""
+        killed, builtin_n, failed, blocked = 0, 0, 0, []
+        for d in items:
+            if d.get("source") == "内置":
+                builtin_n += 1
+                blocked.append(d["key"])        # 曲库包里的原声文件不动，只拉黑名单
+                continue
+            p = str(d.get("path") or "")
+            inside = False
+            if p and ext_root:
+                try:
+                    inside = os.path.commonpath(
+                        [os.path.abspath(p), ext_root]) == ext_root
+                except Exception:
+                    inside = False
+            if inside and os.path.isfile(p):
+                try:
+                    os.remove(p)                # 真删本地文件
+                    killed += 1
+                    continue
+                except Exception:
+                    pass
+            failed += 1
+            blocked.append(d["key"])            # 删不掉也别让它再冒出来
+        self._trash.forget(keys, blocked_keys=blocked)
+        self._guard(self.player.refresh_library)   # 已删的歌从内存曲库也清掉
+        self._fill_nav()
+        self._select_scope(self._cur_scope)
+        msg = "彻底删掉 {} 首，导入的本地文件删了 {} 个".format(len(items), killed)
+        if builtin_n:
+            msg += ("；{} 首内置原声只从曲库屏蔽，曲库包里的文件一个都没动"
+                    "（想找回来：清掉 playlist\\trash.json 里的屏蔽记录，重启麟就回到曲库了）").format(builtin_n)
+        if failed:
+            msg += "；{} 个文件没能删掉（可能正被占用），也从曲库屏蔽了".format(failed)
+        self._say(msg)
+
+    def _purge_all_trash(self):
+        self._purge_trash(self._trash.keys())
+
+    # ---- 分类夹（歌单）导航 -----------------------------------------------
+    MODE_ICONS = {"sequential": "➡️", "loop": "🔁", "one": "🔂", "random": "🔀"}
+
+    def _build_nav(self):
+        """左侧导航面板：系统分类置顶 + 自建分类夹 + 底部「新建」按钮。"""
+        box = QWidget()
+        box.setFixedWidth(200)
+        box.setObjectName("navBox")
+        box.setStyleSheet(
+            "#navBox{background:rgba(255,250,240,210);"
+            "border:1px solid rgba(216,196,160,190);border-radius:8px;}"
+            "#navBox QLabel{color:#5a3d2b;background:transparent;}"
+            "#navBox QListWidget{background:transparent;border:none;color:#3d2b1f;}"
+            "#navBox QListWidget::item{padding:5px 4px;border-radius:4px;}"
+            "#navBox QListWidget::item:selected{background:rgba(232,213,176,240);color:#3d2b1f;}"
+            "#navBox QListWidget::item:hover{background:rgba(245,235,214,200);}")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(6)
+        title = QLabel("我的分类夹")
+        title.setStyleSheet("font-weight:bold;font-size:14px;")
+        v.addWidget(title)
+        self.nav = QListWidget()
+        self.nav.setDragDropMode(QAbstractItemView.InternalMove)   # 自建分类可上下拖动排序
+        self.nav.setDefaultDropAction(Qt.MoveAction)
+        self.nav.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.nav.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.nav.customContextMenuRequested.connect(self._nav_menu)
+        self.nav.itemClicked.connect(self._on_nav_click)
+        self.nav.model().rowsMoved.connect(self._on_nav_reordered)
+        v.addWidget(self.nav, 1)
+        self.nav_hint = QLabel("")
+        self.nav_hint.setWordWrap(True)
+        self.nav_hint.setStyleSheet("color:#8a6f4d;font-size:11px;")
+        v.addWidget(self.nav_hint)
+        new_btn = QPushButton("＋ 新建分类夹")
+        new_btn.setFocusPolicy(Qt.NoFocus)
+        new_btn.clicked.connect(self._new_playlist)
+        v.addWidget(new_btn)
+        self._nav_box = box
+
+    def _is_user_scope(self, scope_id=None):
+        sid = self._cur_scope if scope_id is None else scope_id
+        return bool(self._store.by_id(sid))
+
+    def _scope_label(self, scope_id):
+        if scope_id == TRASH_SCOPE:
+            return TRASH_NAME
+        for sid, name in SYSTEM_SCOPES:
+            if sid == scope_id:
+                return name
+        return self._store.name_of(scope_id) or "分类夹"
+
+    def _fill_nav(self):
+        """刷新左侧导航（系统分类带数量角标，自建分类夹排在下面）。"""
+        if self.player is None:
+            return
+        self.nav.blockSignals(True)
+        try:
+            self.nav.clear()
+            # 计数只算还在曲库里的：回收站里的、彻底删掉的都不算
+            lib = [t for t in self.player.library_tracks()
+                   if not self._trash.is_hidden(t[2], t[1])]
+            counts = {
+                SYS_ALL: len(lib),
+                SYS_BUILTIN: sum(1 for t in lib if t[2] == "内置"),
+                SYS_EXTERNAL: sum(1 for t in lib if t[2] == "本地"),
+            }
+            for sid, name in SYSTEM_SCOPES:
+                it = QListWidgetItem("{}  ({})".format(name, counts.get(sid, 0)))
+                it.setData(Qt.UserRole, sid)
+                it.setData(Qt.UserRole + 2, "sys")
+                it.setToolTip("系统分类，不可改名/删除")
+                self.nav.addItem(it)
+            # 「我喜欢的音乐」：固定收藏夹（网易云同款），不可删除、不参与拖动排序
+            fav = self._store.ensure_favorites()
+            it = QListWidgetItem("❤ {}  ({})".format(
+                fav["playlist_name"], len(fav["music_list"])))
+            it.setData(Qt.UserRole, FAV_ID)
+            it.setData(Qt.UserRole + 2, "fav")
+            it.setToolTip("收藏夹：点歌前面的 ♥ 就收进来；右键可改名/清空（不能删除）")
+            self.nav.addItem(it)
+            # 回收站：移出的歌先放这里，能恢复，也能彻底删除
+            it = QListWidgetItem("♻ {}  ({})".format(TRASH_NAME, self._trash.count()))
+            it.setData(Qt.UserRole, TRASH_SCOPE)
+            it.setData(Qt.UserRole + 2, "trash")
+            it.setToolTip("移出的歌先放这儿：右键/底部按钮可恢复或彻底删除"
+                          "（彻底删除会删掉导入的本地文件）")
+            self.nav.addItem(it)
+            others = [d for d in self._store.playlists if d["playlist_id"] != FAV_ID]
+            if others:
+                sep = QListWidgetItem("—— 我创建的 ——")
+                sep.setFlags(Qt.NoItemFlags)
+                sep.setForeground(QColor("#a8845c"))
+                self.nav.addItem(sep)
+            for d in others:
+                it = QListWidgetItem("🎵 {}  ({})".format(
+                    d["playlist_name"], len(d["music_list"])))
+                it.setData(Qt.UserRole, d["playlist_id"])
+                it.setData(Qt.UserRole + 2, "user")
+                it.setToolTip("右键：重命名 / 清空 / 删除；上下拖动可调顺序")
+                self.nav.addItem(it)
+            target = self._want_scope or self._cur_scope
+            for i in range(self.nav.count()):
+                it = self.nav.item(i)
+                if it.data(Qt.UserRole) == target:
+                    self.nav.setCurrentItem(it)
+                    break
+        finally:
+            self.nav.blockSignals(False)
+
+    def _sync_nav_selection(self):
+        self.nav.blockSignals(True)
+        try:
+            target = self._want_scope or self._cur_scope
+            for i in range(self.nav.count()):
+                it = self.nav.item(i)
+                if it.data(Qt.UserRole) == target:
+                    self.nav.setCurrentItem(it)
+                    break
+        finally:
+            self.nav.blockSignals(False)
+
+    def _scope_tracks(self, scope_id):
+        """某个分类下的曲目：系统分类直接过滤曲库，自建分类按歌单里存的顺序还原。"""
+        if self.player is None:
+            return []
+        if scope_id == TRASH_SCOPE:
+            return self._trash.tracks()     # 回收站只读：看看有哪些，不参与播放
+        lib = [t for t in self.player.library_tracks()
+               if not self._trash.is_hidden(t[2], t[1])]
+        if scope_id == SYS_ALL:
+            return lib
+        if scope_id == SYS_BUILTIN:
+            return [t for t in lib if t[2] == "内置"]
+        if scope_id == SYS_EXTERNAL:
+            return [t for t in lib if t[2] == "本地"]
+        by_key = {track_key(t[2], t[1]): t for t in lib}
+        by_title = {}
+        for t in lib:
+            by_title.setdefault(t[1], t)
+        out, seen = [], set()
+        for k in self._store.keys(scope_id):
+            t = by_key.get(k)
+            if t is None:
+                # 老歌单里的来源标签可能是旧版错标的（"本地|内置曲名"），按曲名找回
+                t = by_title.get(split_key(k)[1])
+            if t is None:
+                continue            # 文件被删了就跳过这一首，不阻塞整个歌单
+            if self._trash.is_hidden(t[2], t[1]):
+                continue            # 进了回收站的歌先别在分类夹里露头
+            rk = track_key(t[2], t[1])
+            if rk in seen:
+                continue            # 旧键 + 新键指向同一首时只显示一次
+            seen.add(rk)
+            out.append(t)
+        return out
+
+    def _select_scope(self, scope_id, autoplay=False, immediate=False):
+        """切换分类夹：默认让当前这首歌放完再换队列（需求 3.2.1），
+        设置里勾了「立即切换」就当场换。
+
+        不管队列换不换，列表都立刻切到目标分类夹——用户点了分类夹，
+        第一眼就该看见里面的歌（以前延迟切换时列表也留在旧分类，
+        用户以为「点了创建好的分类夹没反应」）。
+        """
+        if self.player is None:
+            self._cur_scope = scope_id
+            self._want_scope = None
+            return
+        if scope_id == TRASH_SCOPE:
+            # 回收站是只读视图：只换列表，播放队列一点不动，
+            # 免得把「已经删掉」的歌又塞回播放器
+            self._cur_scope = TRASH_SCOPE
+            self._want_scope = None
+            self.nav_hint.setText("")
+            self._refresh_all()
+            return
+        tracks = self._scope_tracks(scope_id)
+        win = self.parent()
+        immediate = immediate or bool(getattr(win, "settings", {}).get(
+            "playlist_switch_immediate", False))
+        defer = (self.player.is_playing() or self.player.is_paused()) and not immediate
+        self._switching = True
+        try:
+            switched = self.player.set_scope(tracks, scope_id, defer=defer)
+        finally:
+            self._switching = False
+        if switched:
+            self._cur_scope = scope_id
+            self._want_scope = None
+            self.nav_hint.setText("")
+        else:
+            # 列表先切到目标分类夹（_view_tracks 读 _want_scope），播放队列不动；
+            # 等这首放完播放器自己套上新队列再发 scopeChanged
+            self._cur_scope = scope_id
+            self._want_scope = scope_id
+            cur = self.player.current_track() or {}
+            self.nav_hint.setText("《{}》放完就切到「{}」…".format(
+                cur.get("title", "当前这首"), self._scope_label(scope_id)))
+        self._refresh_all()
+        if autoplay and self.player.tracks() and not self.player.is_playing():
+            self._guard(lambda: self.player.play_at(0))
+
+    def _on_nav_click(self, item):
+        if item is None:
+            return
+        sid = item.data(Qt.UserRole)
+        if not sid or sid == (self._want_scope or self._cur_scope):
+            return
+        self._select_scope(sid)
+
+    def _on_scope_changed(self, scope_id):
+        """播放器把延迟的分类夹切换真正生效了（上一首放完）。"""
+        self._cur_scope = scope_id
+        self._want_scope = None
+        self.nav_hint.setText("")
+        if not self._switching:
+            self._refresh_all()
+
+    def _on_nav_reordered(self, *args):
+        """拖动改了自建分类的上下顺序：把新顺序写回 playlists.json。"""
+        QTimer.singleShot(0, self._apply_nav_order)
+
+    def _apply_nav_order(self):
+        order = []
+        for i in range(self.nav.count()):
+            it = self.nav.item(i)
+            if it.data(Qt.UserRole + 2) == "user":
+                order.append(it.data(Qt.UserRole))
+        if order:
+            self._store.set_order(order)
+        self._fill_nav()
+
+    def _nav_menu(self, pos):
+        it = self.nav.itemAt(pos)
+        kind = it.data(Qt.UserRole + 2) if it is not None else None
+        if kind == "trash":
+            menu = QMenu(self)
+            a_play = menu.addAction("▶ 切到回收站")
+            a_back = menu.addAction("♻ 全部恢复（放回曲库）")
+            menu.addSeparator()
+            a_kill = menu.addAction("🗑 彻底删除全部（不可恢复）")
+            act = menu.exec_(self.nav.mapToGlobal(pos))
+            if act is a_play:
+                self._select_scope(TRASH_SCOPE)
+            elif act is a_back:
+                self._restore_all_trash()
+            elif act is a_kill:
+                self._purge_all_trash()
+            return
+        if kind == "fav":
+            pid = it.data(Qt.UserRole)
+            menu = QMenu(self)
+            a_play = menu.addAction("▶ 切到喜欢的音乐")
+            a_rename = menu.addAction("✏️ 重命名")
+            a_clear = menu.addAction("🧹 清空收藏（不删文件）")
+            act = menu.exec_(self.nav.mapToGlobal(pos))
+            if act is a_play:
+                self._select_scope(pid)
+            elif act is a_rename:
+                self._rename_playlist(pid)
+            elif act is a_clear:
+                self._clear_playlist(pid)
+            return
+        if kind != "user":
+            menu = QMenu(self)
+            act = menu.addAction("＋ 新建分类夹")
+            if menu.exec_(self.nav.mapToGlobal(pos)) is act:
+                self._new_playlist()
+            return
+        pid = it.data(Qt.UserRole)
+        menu = QMenu(self)
+        a_play = menu.addAction("▶ 切到这个分类夹")
+        a_rename = menu.addAction("✏️ 重命名")
+        a_clear = menu.addAction("🧹 清空歌曲（不删文件）")
+        a_up = menu.addAction("⬆ 上移")
+        a_down = menu.addAction("⬇ 下移")
+        menu.addSeparator()
+        a_del = menu.addAction("🗑 删除分类夹（不删文件）")
+        act = menu.exec_(self.nav.mapToGlobal(pos))
+        if act is a_play:
+            self._select_scope(pid)
+        elif act is a_rename:
+            self._rename_playlist(pid)
+        elif act is a_clear:
+            self._clear_playlist(pid)
+        elif act is a_up:
+            self._store.move(pid, -1)
+            self._fill_nav()
+        elif act is a_down:
+            self._store.move(pid, 1)
+            self._fill_nav()
+        elif act is a_del:
+            self._delete_playlist(pid)
+
+    def _say(self, text):
         win = self.parent()
         if hasattr(win, "say"):
-            win.say("麟把曲库重新翻了一遍，全部 {} 首都回来啦～".format(
-                len(self.player.tracks())), split=False)
+            try:
+                win.say(text, split=False)
+            except Exception:
+                pass
+
+    def _new_playlist(self):
+        name, ok = QInputDialog.getText(
+            self, "新建分类夹", "分类夹名称（最多 {} 字）：".format(NAME_MAX))
+        if not ok:
+            return
+        name = (name or "").strip()
+        if not name:
+            QMessageBox.information(self, "新建分类夹", "名字不能是空的哦～")
+            return
+        d = self._store.create(name)
+        if not d:
+            return
+        self._fill_nav()
+        self._select_scope(d["playlist_id"])
+        self._say("新分类夹「{}」建好啦～在歌曲上右键就能往里放♪".format(
+            d["playlist_name"]))
+
+    def _rename_playlist(self, pid):
+        d = self._store.by_id(pid)
+        if not d:
+            return
+        name, ok = QInputDialog.getText(
+            self, "重命名分类夹", "新的名字（最多 {} 字）：".format(NAME_MAX),
+            text=d["playlist_name"])
+        if not ok:
+            return
+        if not (name or "").strip():
+            QMessageBox.information(self, "重命名分类夹", "名字不能是空的哦～")
+            return
+        self._store.rename(pid, name)
+        self._fill_nav()
+        self._say("分类夹改名叫「{}」啦～".format(self._store.name_of(pid)))
+
+    def _clear_playlist(self, pid):
+        name = self._store.name_of(pid)
+        r = QMessageBox.question(
+            self, "清空分类夹",
+            "清空「{}」里的全部歌曲？\n\n只解除收纳关系，"
+            "不会删除本地音乐文件，其他分类夹也不受影响。".format(name),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        self._store.clear(pid)
+        self._fill_nav()
+        if self._cur_scope == pid:
+            self._select_scope(pid)
+        self._say("「{}」清空啦，歌都还在～".format(name))
+
+    def _delete_playlist(self, pid):
+        if self._store.is_favorites(pid):
+            self._say("「{}」是麟的收藏夹，删不掉哦～想清空的话右键它就好".format(FAV_NAME))
+            return
+        name = self._store.name_of(pid)
+        r = QMessageBox.question(
+            self, "删除分类夹",
+            "删除分类夹「{}」？\n\n仅删除分类，不会删除本地音乐文件。".format(name),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if r != QMessageBox.Yes:
+            return
+        self._store.delete(pid)
+        if pid in (self._cur_scope, self._want_scope):
+            self._cur_scope = SYS_ALL
+            self._want_scope = None
+        self._fill_nav()
+        self._select_scope(self._cur_scope)
+        self._say("分类夹「{}」删掉啦，歌一首没少".format(name))
+
+    def _selected_keys(self):
+        keys = []
+        for it in self.queue.selectedItems():
+            k = it.data(Qt.UserRole + 2)
+            if k and k not in keys:
+                keys.append(k)
+        return keys
+
+    def _toggle_playlist(self, pid, keys):
+        d = self._store.by_id(pid)
+        if not d or not keys:
+            return
+        stored = self._stored_keys(pid, keys)
+        if len(stored) >= len(set(keys)):
+            n = self._store.remove_tracks(pid, stored)
+            msg = "从「{}」拿出 {} 首（文件还在）".format(d["playlist_name"], n)
+        else:
+            # 老歌单里存着旧来源标签的键，别再重复加一遍同一首
+            have = set(self._resolved_key(k) for k in self._store.keys(pid))
+            add = [k for k in keys if self._resolved_key(k) not in have]
+            n = self._store.add_tracks(pid, add)
+            msg = "往「{}」放进 {} 首♪".format(d["playlist_name"], n)
+        self._fill_nav()
+        if self._cur_scope == pid:
+            self._select_scope(pid)
+        self._say(msg)
+
+    def _queue_menu(self, pos):
+        if self.player is None:
+            return
+        keys = self._selected_keys()
+        if self._cur_scope == TRASH_SCOPE and not self._want_scope:
+            # 回收站里只给两件事：恢复、彻底删除（列表是只读的，不能播放/收藏）
+            menu = QMenu(self)
+            a_back = menu.addAction("♻ 恢复选中（放回曲库）")
+            a_kill = menu.addAction("🗑 彻底删除选中（不可恢复）")
+            a_back.setEnabled(bool(keys))
+            a_kill.setEnabled(bool(keys))
+            act = menu.exec_(self.queue.viewport().mapToGlobal(pos))
+            if act is a_back:
+                self._restore_trash(keys)
+            elif act is a_kill:
+                self._purge_trash(keys)
+            return
+        menu = QMenu(self)
+        if keys:
+            fav_on = all(self._is_fav_key(k) for k in keys)
+            act = menu.addAction("💔 取消喜欢" if fav_on else "♥ 喜欢（收进收藏夹）")
+            act.triggered.connect(
+                lambda _c=False, ks=list(keys): self._toggle_fav(ks))
+            menu.addSeparator()
+        add_menu = menu.addMenu("➕ 添加到分类夹")
+        others = [d for d in self._store.playlists if d["playlist_id"] != FAV_ID]
+        if others:
+            for d in others:
+                pid = d["playlist_id"]
+                act = QAction(d["playlist_name"], add_menu)
+                act.setCheckable(True)
+                act.setChecked(bool(keys) and len(self._stored_keys(pid, keys)) >= len(set(keys)))
+                act.setEnabled(bool(keys))
+                act.triggered.connect(
+                    lambda _c=False, p=pid, ks=list(keys): self._toggle_playlist(p, ks))
+                add_menu.addAction(act)
+        else:
+            act = add_menu.addAction("还没有分类夹，点这里新建…")
+            act.triggered.connect(self._new_playlist)
+        if self._is_user_scope():
+            act = menu.addAction("➖ 从「{}」移除".format(
+                self._scope_label(self._cur_scope)))
+            act.triggered.connect(self._remove_selected)
+        first = self.queue.itemAt(pos)
+        if first is not None:
+            idx = first.data(Qt.UserRole + 1)
+            if isinstance(idx, int) and idx >= 0:
+                act = menu.addAction("▶ 播放这首")
+                act.triggered.connect(
+                    lambda _c=False, i=idx: self._guard(lambda: self.player.play_at(i)))
+        menu.exec_(self.queue.viewport().mapToGlobal(pos))
+
+    def _on_queue_reordered(self, *args):
+        """自建分类夹里拖动歌曲调顺序：落定后把新顺序写回歌单。"""
+        if self.player is None or not self._is_user_scope():
+            return
+        QTimer.singleShot(0, self._apply_queue_order)
+
+    def _apply_queue_order(self):
+        if self.player is None or not self._is_user_scope():
+            return
+        keys = []
+        for i in range(self.queue.count()):
+            it = self.queue.item(i)
+            k = it.data(Qt.UserRole + 2) if it is not None else None
+            if k:
+                keys.append(k)
+        pid = self._cur_scope
+        if keys and self._store.keys(pid) != keys:
+            self._store.set_tracks(pid, keys)
+            if self.player.pending_scope() is None:
+                # 调序不打断播放：歌还是这一批，只是顺序变了，当场换队列即可
+                self.player.set_scope(self._scope_tracks(pid), pid, defer=False)
+                self._refresh_all()
+            else:
+                self._select_scope(pid)
+
+    def _update_search_hint(self):
+        sid = self._cur_scope
+        if sid == TRASH_SCOPE:
+            txt = "🔍 在回收站里搜索…"
+        elif sid == SYS_ALL:
+            txt = "🔍 搜索全部音乐…"
+        elif sid == SYS_BUILTIN:
+            txt = "🔍 搜索内置原声…"
+        elif sid == SYS_EXTERNAL:
+            txt = "🔍 搜索我的导入…"
+        else:
+            txt = "🔍 在「{}」里搜索…".format(self._scope_label(sid))
+        self.search.setPlaceholderText(txt)
 
     # ---- 封面 -------------------------------------------------------------
     def _load_cover(self):

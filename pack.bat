@@ -6,20 +6,16 @@ cd /d "%~dp0"
 set "BUILD_DIR=C:\LinBuild"
 set "VENV_DIR=C:\LinVenv"
 
-echo [1/4] 复制项目到纯英文路径 %BUILD_DIR% ...
+echo [1/5] 复制项目到纯英文路径 %BUILD_DIR% ...
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 mkdir "%BUILD_DIR%"
 copy /y "*.py"                  "%BUILD_DIR%\"                    >nul
 copy /y "*.png"                 "%BUILD_DIR%\"                    >nul
 copy /y "*.jpg"                 "%BUILD_DIR%\"                    >nul
 copy /y "favicon.ico"           "%BUILD_DIR%\"                    >nul
-if exist "music\*.mp3" (
-    mkdir "%BUILD_DIR%\music" 2>nul
-    copy /y "music\*.mp3"       "%BUILD_DIR%\music\"              >nul
-)
-echo 完成。
+echo 完成。（第17轮起曲库不打进 exe，这里不再复制 music\*.mp3）
 
-echo [2/4] 准备独立打包环境（第一次约2-5分钟，之后秒开）...
+echo [2/5] 准备独立打包环境（第一次约2-5分钟，之后秒开）...
 if not exist "%VENV_DIR%\Scripts\python.exe" (
     python -m venv "%VENV_DIR%"
     "%VENV_DIR%\Scripts\python.exe" -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
@@ -27,11 +23,22 @@ if not exist "%VENV_DIR%\Scripts\python.exe" (
 )
 echo 完成。
 
-echo [3/4] 开始打包（需要几分钟，请耐心等待）...
+echo [3/5] 生成曲目清单 builtin_tracks.json（exe 里只带清单，不带音频）...
+"%VENV_DIR%\Scripts\python.exe" "%~dp0make_manifest.py" "%~dp0music"
+if errorlevel 1 (
+    echo [错误] 生成曲目清单失败！请确认 music 文件夹里的音频还在。
+    pause
+    exit /b 1
+)
+copy /y "%~dp0builtin_tracks.json" "%BUILD_DIR%\" >nul
+del /q "%~dp0builtin_tracks.json" >nul 2>nul
+echo 完成。
+
+echo [4/5] 开始打包（需要几分钟，请耐心等待）...
 cd /d "%BUILD_DIR%"
 set PYTHONUTF8=1
 set PYTHONIOENCODING=utf-8
-"%VENV_DIR%\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --noupx --name "LinDesktopPet" --icon "favicon.ico" --add-data "*.png;." --add-data "*.jpg;." --add-data "music/*.mp3;music" oc.py
+"%VENV_DIR%\Scripts\pyinstaller.exe" --noconfirm --clean --onefile --windowed --noupx --name "LinDesktopPet" --icon "favicon.ico" --add-data "*.png;." --add-data "*.jpg;." --add-data "builtin_tracks.json;." oc.py
 if errorlevel 1 (
     echo.
     echo [错误] 打包失败！请把上方红色报错发给我。
@@ -39,14 +46,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [4/4] 把成品复制回你的桌宠文件夹...
+echo [5/5] 把成品复制回你的桌宠文件夹...
 copy /y "%BUILD_DIR%\dist\LinDesktopPet.exe" "%~dp0LinDesktopPet.exe" >nul
 echo.
 echo ==============================================
 echo   打包完成！
-echo   成品在：%~dp0LinDesktopPet.exe
+echo   成品在：%~dp0LinDesktopPet.exe（约 115MB）
 echo   已使用图标：favicon.ico
-echo   把这个 exe + 使用说明.txt 发给朋友即可。
-echo   所有 .py 模块与图片已自动打包，首次运行会自动生成数据文件。
+echo   发布物 = 这个 exe + 「原声曲库.zip」；
+echo   曲库包解压到 exe 旁边的 music\原声\（用户只需一次）。
+echo   所有 .py 模块、图片与曲目清单已打进 exe，首次运行会自动生成数据文件。
 echo ==============================================
 pause

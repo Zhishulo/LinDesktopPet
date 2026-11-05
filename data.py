@@ -7,7 +7,8 @@ import json
 import time   # append_log 用 time.strftime 写时间戳（缺失会导致聊天时崩溃）
 from pathlib import Path
 
-from config import DEFAULT_ITEMS, DEFAULT_SETTINGS, DEFAULT_README, MEMORY_FILE, MEMORY_LOG_DIR
+from config import (DEFAULT_ITEMS, DEFAULT_SETTINGS, DEFAULT_README, README_VERSION,
+                    MEMORY_FILE, MEMORY_LOG_DIR)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 def data_dir():
@@ -104,6 +105,34 @@ def append_log(role, text):
     save_log(log)
 
 
+README_MARK = "<!-- readme-version: {} -->"
+
+
+def _refresh_readme(readme):
+    """说明书跟着版本走。
+
+    帮助窗口是实时读 readme.md 的；以前只在文件不存在时写一次，老用户升级后
+    看到的还是旧说明书。现在按 README_VERSION 判断：版本变了就把旧的备份成
+    readme_旧版_<时间>.md，再写一份新的（用户自己改过的内容不会被直接丢掉）。
+    """
+    want = DEFAULT_README.rstrip() + "\n\n" + README_MARK.format(README_VERSION) + "\n"
+    try:
+        old = ""
+        if os.path.exists(readme):
+            old = Path(readme).read_text(encoding="utf-8", errors="ignore")
+        if old and README_MARK.format(README_VERSION) in old:
+            return
+        if old.strip():
+            bak = os.path.join(
+                os.path.dirname(readme),
+                "readme_旧版_%s_%03d.md" % (time.strftime("%Y%m%d_%H%M%S"),
+                                           int(time.time() * 1000) % 1000))
+            Path(bak).write_text(old, encoding="utf-8")
+        Path(readme).write_text(want, encoding="utf-8")
+    except Exception:
+        pass    # 说明书刷新失败绝不能拦住启动
+
+
 def ensure_data_files():
     """首次运行时自动生成所有数据文件（不用你手动建）"""
     if not os.path.exists(os.path.join(data_dir(), "items.json")):
@@ -130,9 +159,7 @@ def ensure_data_files():
         Path(notes).write_text("# 麟的随手记\n", encoding="utf-8")
     if not os.path.exists(safe_data_path("settings.json")):
         save_json("settings.json", DEFAULT_SETTINGS)
-    readme = safe_data_path("readme.md")
-    if not os.path.exists(readme):
-        Path(readme).write_text(DEFAULT_README, encoding="utf-8")
+    _refresh_readme(safe_data_path("readme.md"))
     if not os.path.exists(safe_data_path(MEMORY_FILE)):
         save_memory(load_memory())
     os.makedirs(os.path.join(data_dir(), MEMORY_LOG_DIR), exist_ok=True)

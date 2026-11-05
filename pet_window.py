@@ -51,6 +51,7 @@ from context_budget import ContextBudget     # 上下文预算 + 滚动摘要（
 import listening                             # 听歌状态机（纯 stdlib，不依赖 Qt/winrt）
 import care                                  # 情绪察觉 + 主动关心（纯 stdlib，只读心情/评测）
 import music_folder                          # 本地音乐播放器（QMediaPlayer，主线程）
+import single_instance                       # 单实例守卫（多次双击 exe 也只留一只麟）
 from local_brain import local_reply as _local_reply
 from memory import memory_log_dir, write_daily_log, extract_facts_local
 from mood import (load_moods, save_moods, recent_records, NEGATIVE_KEYS,
@@ -1272,10 +1273,20 @@ class PetWindow(QWidget):
         self._write_daily_log(target, summary, highlights, facts)
         if self.dlg_state in ("idle", "complete"):
             self.say("记忆小本本更新啦：{}".format(summary), split=False)
+    def _is_night_hour(self, hour=None):
+        """是否在麟的睡觉时段（SLEEP_HOUR_START 起、SLEEP_HOUR_END 前）。
+
+        统一入口：以前这个判断散在三处硬编码 23，改作息时容易漏改，
+        现在只改 config.SLEEP_HOUR_START / SLEEP_HOUR_END 就全生效。
+        """
+        if hour is None:
+            hour = time.localtime().tm_hour
+        return hour >= SLEEP_HOUR_START or hour < SLEEP_HOUR_END
+
     def _sleep_prompt_segment(self):
         """睡眠状态下的语气注入：好感度决定态度，时间段决定睡意浓度，绝不断联"""
         hour = time.localtime().tm_hour
-        night = (hour >= 23 or hour < 7)
+        night = self._is_night_hour(hour)
         lv = self._level_index(self.affinity)   # 0初识 / 1熟悉 / 2信赖 / 3亲密 / 4挚友
         if lv >= 3:
             head = ("你是被幸歌轻轻叫醒的，一点也不生气，只有困乎乎的软糯撒娇："
@@ -1637,7 +1648,12 @@ class PetWindow(QWidget):
             try:
                 self._mf_player = music_folder.MusicFolderPlayer(self)
                 self._mf_player.set_volume(int(self.settings.get("music_volume", 70)))
-                self._mf_player.set_mode(self.settings.get("music_playback", "random"))
+                # 四种模式：sequential / loop / one / random（随机=洗牌式，
+                # 一轮内不重复；读到不认识的值统一回落顺序播放）
+                mode = str(self.settings.get("music_playback", "sequential"))
+                if mode not in ("sequential", "loop", "one", "random"):
+                    mode = "sequential"
+                self._mf_player.set_mode(mode)
                 self._mf_player.restore_all(keep_title=self.settings.get("music_last_title", ""))
                 self._mf_player.trackChanged.connect(self._on_mf_track)
                 self._mf_player.modeChanged.connect(self._on_mf_mode)
@@ -1675,34 +1691,52 @@ class PetWindow(QWidget):
                 pass
 
     def _start_music_impl(self):
-        """开始放音乐：优先本地播放器（不限时），缺 QtMultimedia 回落八音盒 60 秒。"""
-        if self.sleep_mode:
-            self.say("呼噜…Zzz…（麟睡着了，听不了歌啦。输入 #醒 叫醒我）", split=False)
-            return
+        """开始放音乐：优先本地播放器（不限时），缺 QtMultimedia 回落八音盒 60 秒。
+
+        注意：音乐播放器是「麟房间里的音响」，不是麟在唱——所以麟睡着了音乐
+        也照放（以前这里会拒绝并让用户先 #醒，被反馈成 bug）。睡着时只是回话
+        换成迷迷糊糊的睡音，音频照样出声。
+        """
+        asleep = bool(self.sleep_mode)
         if self.game_mode:
             self.say("麟检测到你在打游戏，缩在角落里不敢出声…关掉游戏就能放歌啦", split=False)
             return
         mf = self.music_player()
         if mf is not None:
+            if not mf.tracks() and mf.library_tracks():
+                # 面板停在某个空分类夹时，桌宠说「放歌」不该被空歌单挡住
+                mf.set_scope(mf.library_tracks(), "sys_all")
             if not mf.tracks():
-                self.say("麟的曲库还是空的！把歌拖进 exe 旁边的 music 文件夹，"
-                         "或打开「🎵 音乐播放器」点「📥 导入音乐」～", split=False)
+                total, found = music_folder.missing_builtin()
+                if total and found < total:
+                    self.say("麟的曲库还是空的…原声曲库好像还没搬过来（找到 {} / {} 首）。"
+                             "把「原声曲库.zip」解压到 exe 旁边的 music\\原声\\ 就好啦～"
+                             .format(found, total), split=False)
+                else:
+                    self.say("麟的曲库还是空的！把歌拖进 exe 旁边的 music 文件夹，"
+                             "或打开「🎵 音乐播放器」点「📥 导入音乐」～", split=False)
                 return
             self.music_mode = True
-            self.music_end = 0        # 0 = 不限时，手动停/入睡/进游戏/退出才停
+            self.music_end = 0        # 0 = 不限时，手动停/进游戏/退出才停（入睡不停）
             self._music_started_at = time.time()   # clock_tick 收尾判断的 3 秒宽限期
             if not mf.is_playing():
                 mf.play(self.settings.get("music_last_title") or None)
             cur = mf.current_track()
             name = cur["title"] if cur else "你的歌"
-            self.say("好呀～麟放歌给你听：《{}》♪".format(name), split=False)
+            if asleep:
+                self.say("唔…（迷迷糊糊把音响拧开）…《{}》…Zzz…".format(name), split=False)
+            else:
+                self.say("好呀～麟放歌给你听：《{}》♪".format(name), split=False)
             return
         # 降级路径：没有 QtMultimedia（老机器/精简环境）→ 八音盒，保留 60 秒旧行为
         self.music_mode = True
         self.music_end = time.time() + 60
         self._music_started_at = time.time()
         if self._start_music_audio():
-            self.say("好呀～麟给你播 60 秒的八音盒～", split=False)
+            if asleep:
+                self.say("唔…（顺手按下八音盒）…60 秒…Zzz…", split=False)
+            else:
+                self.say("好呀～麟给你播 60 秒的八音盒～", split=False)
         else:
             self.say("好呀～麟陪你安静待 60 秒…（这台电脑放不出声音，麟就在旁边陪你）", split=False)
 
@@ -1723,9 +1757,7 @@ class PetWindow(QWidget):
         面板是非模态窗口（开着也能操作桌宠本体），有自己的任务栏项。
         窗口行为：标题栏 — 最小化到任务栏（音乐继续）、× 关闭=停歌。
         """
-        if self.sleep_mode:
-            self.say("呼噜…Zzz…（麟睡着了，听不了歌啦。输入 #醒 叫醒我）", split=False)
-            return
+        # 麟睡着也能开播放器（音响是音响，麟是麟）；只有打游戏时才收敛
         if self.game_mode:
             self.say("麟检测到你在打游戏，缩在角落里不敢出声…关掉游戏就能放歌啦", split=False)
             return
@@ -1766,6 +1798,31 @@ class PetWindow(QWidget):
         dlg.show()
         QTimer.singleShot(0, lambda d=dlg: self._set_hwnd_topmost(d.winId(), False))
         self._force_taskbar_button(dlg)   # 最小化后在任务栏有自己的图标，一点就回来
+
+    def _check_music_library(self):
+        """启动自检：原声曲库包没就位时，用普通对话气泡提醒一次（不弹窗、不抢焦点）。
+
+        曲库外置以后（exe 只装代码，77+ 首原声放在 exe 旁 music\原声\），
+        用户只覆盖 exe 或漏解压曲库包时，「内置原声」会莫名变空。
+        与其让人以为是 bug，不如让麟自己说一句怎么修。
+        """
+        try:
+            total, found = music_folder.missing_builtin()
+        except Exception:
+            return
+        if not total or found >= total:
+            return
+        try:
+            if found <= 0:
+                self.say("唔…麟的音响好像还没搬过来（{} 首原声一首都没找到）。"
+                         "把「原声曲库.zip」解压到 exe 旁边的 music\\原声\\ 就好啦～"
+                         "现在只能放你自己导入的歌哦。".format(total), split=False)
+            else:
+                self.say("唔…麟的音响好像少了 {} 首歌（找到 {} / {} 首）。"
+                         "重新解压一下「原声曲库.zip」到 music\\原声\\ 吧～"
+                         .format(total - found, found, total), split=False)
+        except Exception:
+            pass
 
     @staticmethod
     def _force_taskbar_button(dlg):
@@ -2442,7 +2499,8 @@ class PetWindow(QWidget):
     # ---------- 自动问候 / 随机小剧场 / 笔记复习 ----------
     def _greet(self):
         hour = time.localtime().tm_hour
-        if hour >= 23 or hour < 7:
+        # 睡觉时段默认在打呼；被 #醒 叫醒的夜里照常问好，只是话里带困意
+        if self._is_night_hour(hour) and not self.manual_awake:
             self.say("呼噜呼噜…Zzz…", split=False)
             return
         if 5 <= hour < 11:
@@ -2451,7 +2509,7 @@ class PetWindow(QWidget):
             g = "中午好！幸歌吃过午饭了吗？"
         elif 14 <= hour < 18:
             g = "下午好～要不要陪麟出去走一走？"
-        elif 18 <= hour < 23:
+        elif 18 <= hour < SLEEP_HOUR_START:
             g = "晚上好，幸歌！今天过得怎么样呀？"
         else:
             g = "这么晚了还在熬夜呀…要好好休息哦，麟会陪着你的。"
@@ -2555,7 +2613,7 @@ class PetWindow(QWidget):
             pass
 
     def _update_daynight(self, hour):
-        night = (hour >= 23 or hour < 7)
+        night = self._is_night_hour(hour)
         if not night:
             self.manual_awake = False      # 到了白天，强行叫醒的标记自然失效
         # #醒 之后夜间不再立刻睡回去，否则「醒来一秒又睡」且 #音乐 会被拒绝
@@ -2605,8 +2663,10 @@ class PetWindow(QWidget):
         self._sleep_pending = False
         self.forced_sleep = forced
         self.sleep_mode = True
-        self.music_mode = False          # 睡觉时结束听歌陪伴
-        self._stop_music_audio()
+        # 睡觉不再停音乐：音乐播放器是麟房间里的音响，不是麟在唱。
+        # 以前这里会 music_mode=False + _stop_music_audio()，被用户反馈成 bug
+        # （「麟睡着了不等于音乐也会停」）。八音盒降级路径的 60 秒到点仍由
+        # _clock_tick 的 music_end 分支收尾，不受影响。
         self._stop_all_timers()
         self.dlg_state = "idle"
         self.bubble.hide()
@@ -2725,11 +2785,15 @@ class PetWindow(QWidget):
     def _focus_bubble_refresh(self, txt):
         """把倒计时搬到桌宠气泡上常驻显示（用户要求更显眼）。
 
-        只在「气泡空闲」（dlg_state == idle，没有正在打的字/别的台词）时
-        接管；聊天或事件说这句话时会正常走 say() 抢回气泡，说完淡出回到
+        只在「气泡空闲」或「气泡已经在显示倒计时」（dlg_state == focus）时
+        刷新；聊天或事件说这句话时会正常走 say() 抢回气泡，说完淡出回到
         idle 后，下一秒倒计时自动回来——这就是"聊天时让位、聊完回来"。
+
+        注意 focus 态必须放行：本方法自己把 dlg_state 置成 "focus"，
+        如果这里只认 idle，下一 tick 就会被自己挡回去，气泡时间冻结、
+        和底栏每秒刷新的时间越差越多（用户反馈的"两个时间不一样"）。
         """
-        if not self.focus_active or self.dlg_state != "idle":
+        if not self.focus_active or self.dlg_state not in ("idle", "focus"):
             return
         if self.sleep_mode or self.game_mode:
             return
@@ -3938,6 +4002,12 @@ def main():
 
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
+
+    # ---- 单实例守卫：多次双击 exe 不再冒出好几只麟 ----
+    # 必须在建窗口/装托盘之前：第二个进程只负责把已在跑的那只叫到最前，然后立刻退出，
+    # 不新建窗口、不装托盘、不写任何数据文件。拿不到唯一资格就安静退出（退出码 0）。
+    if not single_instance.try_acquire():
+        return 0
     # 设置窗口/任务栏图标（favicon.ico 随 exe 一起打包）
     icon_path = resource_path("favicon.ico")
     if os.path.exists(icon_path):
@@ -3985,4 +4055,16 @@ def main():
     except Exception as e:
         print("[tray]", e)
 
+    # 曲库自检（等窗口和气泡都就绪）：曲库包没解压/被删时让麟自己说怎么装，
+    # 而不是让「内置原声」莫名变空。只是说话，不弹窗。
+    QTimer.singleShot(3000, win._check_music_library)
+
+    def _bring_to_front():
+        """后来启动的 exe 通知唯一实例：把麟叫到最前（托盘隐藏时先显示）。"""
+        if not win.isVisible():
+            win.show()
+        win.raise_()
+        win.activateWindow()
+
+    single_instance.set_activate(_bring_to_front)
     sys.exit(app.exec_())
